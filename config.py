@@ -9,10 +9,10 @@ CLOB_API = "https://clob.polymarket.com"
 # Trading Parameters
 TRIGGER_PRICE = 0.96  # When a side reaches this price, we buy that side
 ORDER_PRICE = 0.97    # Price we're willing to pay (fill or kill)
-STOP_LOSS_PRICE = 0.85  # Emergency stop loss if price collapses (optional - disable if holding to resolution)
+STOP_LOSS_PRICE = 0.8  # Emergency stop loss if price collapses (optional - disable if holding to resolution)
 
 # Position sizing
-MAX_POSITION_SIZE = 10  # Maximum USD to risk per trade
+MAX_POSITION_SIZE = 5  # Maximum USD to risk per trade
 
 # Monitoring
 POLL_INTERVAL = 0.1  # Seconds between price checks

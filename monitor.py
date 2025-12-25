@@ -26,6 +26,9 @@ class MarketMonitor:
         self.active_markets = []
         self.price_cache = {}  # token_id -> latest price
         self.last_update = None
+        self.current_market = None  # Currently active market
+        self.current_market_end_time = None  # When current market ends
+        self.et_tz = pytz.timezone('America/New_York')
     
     def get_active_btc_15min_markets(self) -> List[Dict]:
         """
@@ -390,10 +393,103 @@ class MarketMonitor:
             logger.debug(f"Error getting order book for {token_id[:10]}...: {e}")
             return None
     
+    def _extract_market_end_time(self, market: Dict) -> Optional[datetime]:
+        """
+        Extract the end time of a market from its question
+        
+        Example: "Bitcoin Up or Down - December 25, 4:45PM-5:00PM ET"
+        Returns: datetime(2024, 12, 25, 17, 0, 0, tzinfo=ET)
+        """
+        try:
+            question = market.get('question', '')
+            
+            # Regex to extract date and end time
+            # Handles both "4:45PM-5:00PM ET" and "4:45-5:00PM ET"
+            date_time_pattern = r'(\w+ \d+),?\s+\d+:\d+(?:AM|PM)?-(\d+):(\d+)(AM|PM)'
+            match = re.search(date_time_pattern, question)
+            
+            if not match:
+                logger.debug(f"Could not parse end time from: {question}")
+                return None
+            
+            date_str, end_hour, end_min, end_period = match.groups()
+            
+            # Get current year
+            current_year = datetime.now().year
+            full_date_str = f"{date_str} {current_year}"
+            
+            # Parse the date
+            market_date = parser.parse(full_date_str).date()
+            
+            # Convert end time to 24-hour format
+            end_hour_24 = int(end_hour) % 12
+            if end_period == 'PM' and int(end_hour) != 12:
+                end_hour_24 += 12
+            elif end_period == 'AM' and int(end_hour) == 12:
+                end_hour_24 = 0
+            
+            # Create end datetime in ET
+            end_time = self.et_tz.localize(datetime(
+                market_date.year,
+                market_date.month,
+                market_date.day,
+                end_hour_24,
+                int(end_min),
+                0
+            ))
+            
+            return end_time
+            
+        except Exception as e:
+            logger.debug(f"Error extracting end time from '{question}': {e}")
+            return None
+    
+    def _is_current_market_still_active(self) -> bool:
+        """Check if the currently tracked market is still active"""
+        if not self.current_market or not self.current_market_end_time:
+            return False
+        
+        now_et = datetime.now(self.et_tz)
+        
+        # Market is active until it actually ends (no buffer needed)
+        # We'll search for the next market once this one expires
+        return now_et < self.current_market_end_time
+    
     def update_active_markets(self):
-        """Refresh the list of active markets"""
+        """
+        Refresh the list of active markets (optimized)
+        
+        Only searches for new markets if:
+        - No current market, OR
+        - Current market has ended
+        
+        This avoids unnecessary API calls during the 15-minute window.
+        """
+        # Check if we can reuse current market
+        if self._is_current_market_still_active():
+            logger.debug(f"Current market still active until {self.current_market_end_time.strftime('%I:%M:%S%p ET')}, skipping search")
+            self.active_markets = [self.current_market]
+            return self.active_markets
+        
+        # Current market ended or doesn't exist, search for new one
+        if self.current_market:
+            logger.info(f"Current market ended at {self.current_market_end_time.strftime('%I:%M:%S%p ET')}, searching for new market...")
+        
         self.active_markets = self.get_active_btc_15min_markets()
         self.last_update = datetime.now()
+        
+        # Update current market tracking
+        if self.active_markets:
+            self.current_market = self.active_markets[0]
+            self.current_market_end_time = self._extract_market_end_time(self.current_market)
+            
+            if self.current_market_end_time:
+                logger.info(f"Locked onto market: {self.current_market.get('question')}")
+                logger.info(f"  Will monitor until: {self.current_market_end_time.strftime('%I:%M:%S%p ET')}")
+        else:
+            self.current_market = None
+            self.current_market_end_time = None
+        
         return self.active_markets
     
     def get_all_market_prices(self) -> List[Dict]:
@@ -402,8 +498,11 @@ class MarketMonitor:
         
         Returns list of price dicts with market info
         """
+        # Ensure we have active markets (will reuse current if still valid)
+        self.update_active_markets()
+        
         if not self.active_markets:
-            self.update_active_markets()
+            return []
         
         prices = []
         for market in self.active_markets:

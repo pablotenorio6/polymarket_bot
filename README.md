@@ -141,11 +141,18 @@ Si no configuras `POLYMARKET_PRIVATE_KEY`, el bot corre en modo monitor:
 - Busca mercados "Bitcoin Up or Down" de 15 minutos activos
 - Obtiene precios de CLOB `/midpoint` endpoint (precios en tiempo real)
 - Acceso al order book completo para información de trading
+- **Optimización inteligente**: Reutiliza el mercado actual durante su ventana de 15 minutos
 
 **Precios utilizados**:
 - **CLOB Midpoint** ($0.18/$0.82): Precio real de mercado para monitoreo
 - **Order Book** ($0.01/$0.99): Spreads enormes, no útil para monitoreo
 - **outcomePrices** ($0.49/$0.51): Última transacción, puede estar desactualizada
+
+**Optimización de API**:
+El monitor "se bloquea" en un mercado una vez encontrado y solo busca nuevos cuando termina:
+- Sin optimización: ~1,800 búsquedas/hora (una cada 2 segundos)
+- Con optimización: ~4 búsquedas/hora (una por cada mercado de 15 min)
+- **Reducción: 99.8% menos llamadas API**
 
 El bot usa CLOB midpoint para detectar oportunidades ($0.96 trigger) y luego coloca órdenes Fill-or-Kill a precio específico ($0.97).
 

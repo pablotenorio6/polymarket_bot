@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Now import other modules (they will use the configured logging)
 from config import (
     TRIGGER_PRICE, ORDER_PRICE, STOP_LOSS_PRICE,
-    POLL_INTERVAL, MAX_POSITION_SIZE, ENABLE_TAKE_PROFIT
+    POLL_INTERVAL, MAX_POSITION_SIZE, ENABLE_TAKE_PROFIT, ENABLE_STOP_LOSS
 )
 from monitor import MarketMonitor
 from trader import get_trader
@@ -164,14 +164,14 @@ class TradingBot:
             self._execute_trade(down_token, "DOWN", ORDER_PRICE, market)
     
     def _execute_trade(self, token_id: str, side: str, price: float, market: Dict):
-        """Execute a trade"""
+        """Execute a trade and place automatic stop loss order"""
         try:
             # Check if trader is initialized
             if not self.trader.client:
-                logger.warning("⚠️  Trader not initialized - skipping trade")
+                logger.warning("Trader not initialized - skipping trade")
                 return
             
-            # Place order
+            # Place buy order
             order = self.trader.place_buy_order(
                 token_id=token_id,
                 side=side,
@@ -181,9 +181,27 @@ class TradingBot:
             )
             
             if order:
-                # Set stop loss
-                self.risk_manager.set_stop_loss(token_id, STOP_LOSS_PRICE)
                 logger.info(f"  Trade executed successfully!")
+                
+                # Get the position to know how many shares we bought
+                position = self.trader.get_position(token_id)
+                if position and ENABLE_STOP_LOSS:
+                    # Place automatic stop loss order (GTC - stays on exchange)
+                    logger.info(f"  Placing automatic stop loss order...")
+                    stop_loss_order = self.trader.place_stop_loss_order(
+                        token_id=token_id,
+                        stop_loss_price=STOP_LOSS_PRICE,
+                        size=position['size']
+                    )
+                    
+                    if stop_loss_order:
+                        logger.info(f"  STOP LOSS order active at ${STOP_LOSS_PRICE:.3f}")
+                    else:
+                        logger.warning("  Failed to place stop loss order - will use price monitoring instead")
+                        # Fallback to old method of monitoring price
+                        self.risk_manager.set_stop_loss(token_id, STOP_LOSS_PRICE)
+                else:
+                    logger.info("  Stop loss disabled or position not found")
             else:
                 logger.warning("   Trade failed or not filled (FOK)")
                 
@@ -202,25 +220,14 @@ class TradingBot:
             current_prices[price_data['up_token_id']] = price_data['up_price']
             current_prices[price_data['down_token_id']] = price_data['down_price']
         
-        # Check stop losses
-        self.risk_manager.check_stop_losses(current_prices)
         
-        # Check take profits (if enabled)
-        if ENABLE_TAKE_PROFIT:
-            for token_id, position in list(positions.items()):
-                if token_id in current_prices:
-                    current_price = current_prices[token_id]
-                    
-                    # Try take profit at 0.99 (near max)
-                    self.risk_manager.check_take_profit(token_id, current_price, take_profit_price=0.99)
-        else:
-            # Just log position status
-            for token_id, position in positions.items():
-                if token_id in current_prices:
-                    current_price = current_prices[token_id]
-                    unrealized_pnl = (current_price - position['entry_price']) * position['size']
-                    logger.debug(f"  Holding {position['side']}: ${current_price:.3f} (Unrealized P&L: ${unrealized_pnl:+.2f})")
-    
+        # Just log position status
+        for token_id, position in positions.items():
+            if token_id in current_prices:
+                current_price = current_prices[token_id]
+                unrealized_pnl = (current_price - position['entry_price']) * position['size']
+                logger.debug(f"  Holding {position['side']}: ${current_price:.3f} (Unrealized P&L: ${unrealized_pnl:+.2f})")
+
     def shutdown(self):
         """Gracefully shutdown the bot"""
         self.running = False
