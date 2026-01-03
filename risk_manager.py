@@ -10,6 +10,9 @@ from monitor import MarketMonitor
 
 logger = logging.getLogger(__name__)
 
+# After this many cycles without price data, consider market resolved
+NO_PRICE_THRESHOLD = 10
+
 
 class RiskManager:
     """
@@ -20,6 +23,7 @@ class RiskManager:
         self.trader = get_trader()
         self.monitor = MarketMonitor()
         self.stop_losses = {}  # token_id -> stop loss price
+        self.no_price_count = {}  # Track consecutive no-price cycles per token
     
     def set_stop_loss(self, token_id: str, stop_price: float):
         """Set a stop loss for a position"""
@@ -46,15 +50,27 @@ class RiskManager:
             
             current_price = current_prices.get(token_id)
             if current_price is None:
-                logger.warning(f"No price data for {token_id[:10]}...")
+                # Track consecutive no-price cycles
+                self.no_price_count[token_id] = self.no_price_count.get(token_id, 0) + 1
+                
+                if self.no_price_count[token_id] >= NO_PRICE_THRESHOLD:
+                    # Market likely resolved - clean up position
+                    logger.info(f"Market resolved for {position['side']} position - cleaning up")
+                    self._cleanup_resolved_position(token_id)
+                elif self.no_price_count[token_id] == 1:
+                    # Only log first occurrence
+                    logger.debug(f"No price data for {token_id[:10]}...")
                 continue
+            
+            # Reset counter if we got price data
+            self.no_price_count[token_id] = 0
             
             stop_price = self.stop_losses[token_id]
             
             # Check if stop loss triggered
             if current_price <= stop_price:
-                logger.warning(f"⚠️  STOP LOSS TRIGGERED for {position['side']}")
-                logger.warning(f"   Current: ${current_price:.3f} <= Stop: ${stop_price:.3f}")
+                logger.warning(f"STOP LOSS TRIGGERED for {position['side']}")
+                logger.warning(f"  Current: ${current_price:.3f} <= Stop: ${stop_price:.3f}")
                 
                 # Execute stop loss
                 self._execute_stop_loss(token_id, position, current_price)
@@ -78,7 +94,7 @@ class RiskManager:
             
             if order:
                 loss = (sell_price - entry_price) * size
-                logger.warning(f"❌ Stop loss executed. Loss: ${loss:.2f}")
+                logger.warning(f"STOP LOSS EXECUTED | Loss: ${loss:.2f}")
                 
                 # Remove stop loss
                 if token_id in self.stop_losses:
@@ -88,6 +104,29 @@ class RiskManager:
                 
         except Exception as e:
             logger.error(f"Error executing stop loss: {e}")
+    
+    def _cleanup_resolved_position(self, token_id: str):
+        """
+        Clean up a position from a resolved market.
+        The shares will need to be redeemed from Polymarket web interface.
+        """
+        try:
+            # Remove from active positions
+            if token_id in self.trader.active_positions:
+                position = self.trader.active_positions.pop(token_id)
+                logger.info(f"Removed {position['side']} position from tracking (market resolved)")
+                logger.info("  -> Redeem your winnings from Polymarket web interface")
+            
+            # Remove stop loss
+            if token_id in self.stop_losses:
+                del self.stop_losses[token_id]
+            
+            # Clean up counter
+            if token_id in self.no_price_count:
+                del self.no_price_count[token_id]
+                
+        except Exception as e:
+            logger.error(f"Error cleaning up resolved position: {e}")
     
     def check_take_profit(
         self,
@@ -114,8 +153,8 @@ class RiskManager:
             return False
         
         if current_price >= take_profit_price:
-            logger.info(f"🎯 TAKE PROFIT OPPORTUNITY at ${current_price:.3f}")
-            logger.info(f"   (Can also hold to resolution for $1.00)")
+            logger.info(f"TAKE PROFIT OPPORTUNITY at ${current_price:.3f}")
+            logger.info(f"  (Can also hold to resolution for $1.00)")
             
             # Execute sell
             order = self.trader.place_sell_order(
@@ -126,7 +165,7 @@ class RiskManager:
             
             if order:
                 profit = (current_price - position['entry_price']) * position['size']
-                logger.info(f"✅ Take profit executed. Profit: ${profit:+.2f}")
+                logger.info(f"TAKE PROFIT EXECUTED | Profit: ${profit:+.2f}")
                 
                 # Remove stop loss
                 if token_id in self.stop_losses:
