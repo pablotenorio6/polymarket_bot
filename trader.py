@@ -25,7 +25,7 @@ class PolymarketTrader:
         """Initialize the trading client"""
         try:
             self.client = self.auth.get_client()
-            logger.info("Trader initialized successfully")
+            logger.debug("Trader initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize trader: {e}")
             raise
@@ -56,8 +56,7 @@ class PolymarketTrader:
             return None
         
         try:
-            logger.info(f"Attempting to BUY {side} at ${price:.3f} for ${size:.2f}")
-            logger.info(f"Market: {market_info.get('question', 'Unknown')[:60]}...")
+            logger.debug(f"Attempting to BUY {side} at ${price:.3f} for ${size:.2f}")
             
             # Calculate shares to buy
             # shares = size / price
@@ -71,7 +70,7 @@ class PolymarketTrader:
             order_args = OrderArgs(
                 token_id=token_id,
                 price=price,
-                size=shares,
+                size=size,
                 side=BUY,
                 fee_rate_bps=0,  # Fee rate in basis points
                 nonce=0  # Will be auto-generated if 0
@@ -84,13 +83,20 @@ class PolymarketTrader:
             order = self.client.post_order(signed_order, orderType=OrderType.FOK)
             
             if order:
-                logger.info(f"Order placed successfully: {order}")
+                order_id = order.get('id', 'N/A')[:16] if order.get('id') else 'matched'
                 
-                # Track position
+                # Calculate actual shares bought (size parameter is shares for BUY)
+                shares_bought = size  # py-clob-client uses size as shares
+                cost_usd = shares_bought * price
+                
+                logger.info(f"BUY ORDER FILLED: {side} | {shares_bought:.2f} shares @ ${price:.2f} = ${cost_usd:.2f}")
+                
+                # Track position with SHARES (not USD)
                 self.active_positions[token_id] = {
                     'side': side,
                     'entry_price': price,
-                    'size': shares,
+                    'size': shares_bought,  # This is shares, not USD
+                    'cost_usd': cost_usd,
                     'market': market_info,
                     'order_id': order.get('id'),
                     'timestamp': order.get('timestamp')
@@ -98,7 +104,7 @@ class PolymarketTrader:
                 
                 return order
             else:
-                logger.warning("Order returned None (possibly not filled)")
+                logger.warning("Order not filled (FOK rejected)")
                 return None
                 
         except Exception as e:
@@ -129,7 +135,7 @@ class PolymarketTrader:
             return None
         
         try:
-            logger.info(f"Attempting to SELL {size:.2f} shares at ${price:.3f} ({order_type})")
+            logger.debug(f"Attempting to SELL {size:.2f} shares at ${price:.3f} ({order_type})")
             
             from py_clob_client.order_builder.constants import SELL
             from py_clob_client.clob_types import OrderArgs, OrderType
@@ -149,7 +155,7 @@ class PolymarketTrader:
             order = self.client.post_order(signed_order, orderType=ot)
 
             if order:
-                logger.info(f"Sell order placed: {order}")
+                order_id = order.get('id', 'N/A')[:16]
                 
                 # Remove from active positions only if it's a FOK order (immediate)
                 # GTC orders (stop loss) don't remove the position yet
@@ -157,56 +163,18 @@ class PolymarketTrader:
                     position = self.active_positions.pop(token_id)
                     entry_price = position['entry_price']
                     pnl = (price - entry_price) * size
-                    logger.info(f"Position closed. P&L: ${pnl:+.2f}")
+                    logger.info(f"SELL ORDER FILLED @ ${price:.2f} | P&L: ${pnl:+.2f}")
+                else:
+                    logger.debug(f"Sell order placed (GTC): {order_id}...")
                 
                 return order
             else:
-                logger.warning(f"Sell order returned None ({order_type})")
+                logger.warning(f"Sell order not filled ({order_type})")
                 return None
                 
         except Exception as e:
             logger.error(f"Error placing sell order: {e}")
             return None
-    
-    def place_stop_loss_order(
-        self,
-        token_id: str,
-        stop_loss_price: float,
-        size: float
-    ) -> Optional[Dict]:
-        """
-        Place a Good-Till-Canceled (GTC) sell order as a stop loss
-        
-        This order will remain active on the exchange and automatically execute
-        if the price drops to the stop loss level.
-        
-        Args:
-            token_id: The token ID to sell
-            stop_loss_price: Price at which to sell (stop loss level)
-            size: Number of shares to sell
-        
-        Returns:
-            Order result dict or None if failed
-        """
-        logger.info(f"Placing STOP LOSS order at ${stop_loss_price:.3f} for {size:.2f} shares")
-        
-        # Use GTC (Good Till Canceled) so the order stays on the book
-        result = self.place_sell_order(
-            token_id=token_id,
-            price=stop_loss_price,
-            size=size,
-            order_type="GTC"
-        )
-        
-        if result:
-            logger.info(f"STOP LOSS order placed successfully - will execute if price drops to ${stop_loss_price:.3f}")
-            
-            # Store stop loss order ID in the position
-            if token_id in self.active_positions:
-                self.active_positions[token_id]['stop_loss_order_id'] = result.get('id')
-                self.active_positions[token_id]['stop_loss_price'] = stop_loss_price
-        
-        return result
     
     def get_position(self, token_id: str) -> Optional[Dict]:
         """Get info about an active position"""

@@ -37,10 +37,16 @@ except ImportError:
 class PolymarketAuth:
     """
     Handles Polymarket authentication using py-clob-client
+    
+    Supports two modes:
+    1. Standard mode: Uses signer wallet for both signing and funds
+    2. Funder mode: Uses signer wallet for signing, funder wallet for funds
     """
     
     def __init__(self):
         self.private_key = os.getenv("POLYMARKET_PRIVATE_KEY")
+        self.funder_address = os.getenv("POLYMARKET_FUNDER_ADDRESS")
+        self.signature_type = int(os.getenv("SIGNATURE_TYPE", "0"))
         self.client = None
         
         if not self.private_key:
@@ -48,7 +54,14 @@ class PolymarketAuth:
     
     def initialize_client(self):
         """
-        Initialize the Polymarket CLOB client
+        Initialize the Polymarket CLOB client with authentication
+        
+        Based on: https://github.com/Polymarket/py-clob-client/
+        
+        Configuration via environment variables:
+        - POLYMARKET_PRIVATE_KEY: Wallet that signs transactions
+        - POLYMARKET_FUNDER_ADDRESS: (Optional) Wallet that has the funds
+        - SIGNATURE_TYPE: 0=EOA, 1=Magic, 2=Browser proxy
         
         Requires: pip install py-clob-client
         """
@@ -59,14 +72,46 @@ class PolymarketAuth:
             from py_clob_client.client import ClobClient
             from py_clob_client.constants import POLYGON
             
-            # Initialize client with private key
-            self.client = ClobClient(
-                host="https://clob.polymarket.com",
-                key=self.private_key,
-                chain_id=POLYGON  # Polymarket runs on Polygon
-            )
+            logger.debug("Initializing Polymarket client...")
             
-            logger.info("Successfully initialized Polymarket client")
+            # Ensure private key has 0x prefix
+            private_key = self.private_key
+            if not private_key.startswith("0x"):
+                private_key = "0x" + private_key
+            
+            # Create client based on configuration
+            if self.funder_address:
+                # Funder mode: signer signs, funder has funds
+                logger.debug(f"Using FUNDER mode (sig_type={self.signature_type}, funder={self.funder_address[:10]}...)")
+                
+                self.client = ClobClient(
+                    host="https://clob.polymarket.com",
+                    key=private_key,
+                    chain_id=POLYGON,
+                    signature_type=self.signature_type,
+                    funder=self.funder_address
+                )
+            else:
+                # Standard mode: signer does everything
+                logger.debug(f"Using STANDARD mode (signature_type={self.signature_type})")
+                
+                self.client = ClobClient(
+                    host="https://clob.polymarket.com",
+                    key=private_key,
+                    chain_id=POLYGON,
+                    signature_type=self.signature_type
+                )
+            
+            # Get wallet addresses
+            signer_address = self.client.get_address()
+            logger.debug(f"Signer wallet: {signer_address}")
+            
+            # Set API credentials using the official method
+            logger.debug("Setting up API credentials...")
+            creds = self.client.create_or_derive_api_creds()
+            self.client.set_api_creds(creds)
+            
+            logger.debug("Polymarket client ready")
             return self.client
             
         except ImportError:

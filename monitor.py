@@ -99,7 +99,7 @@ class MarketMonitor:
                     logger.debug(f"Error checking period {slug}: {e}")
                     continue
             
-            logger.info(f"Found {len(active_markets)} BTC 15-min markets ACTIVE NOW")
+            logger.debug(f"Found {len(active_markets)} BTC 15-min markets ACTIVE NOW")
             return active_markets
             
         except Exception as e:
@@ -473,7 +473,7 @@ class MarketMonitor:
         
         # Current market ended or doesn't exist, search for new one
         if self.current_market:
-            logger.info(f"Current market ended at {self.current_market_end_time.strftime('%I:%M:%S%p ET')}, searching for new market...")
+            logger.debug(f"Current market ended at {self.current_market_end_time.strftime('%I:%M:%S%p ET')}, searching for new market...")
         
         self.active_markets = self.get_active_btc_15min_markets()
         self.last_update = datetime.now()
@@ -484,8 +484,7 @@ class MarketMonitor:
             self.current_market_end_time = self._extract_market_end_time(self.current_market)
             
             if self.current_market_end_time:
-                logger.info(f"Locked onto market: {self.current_market.get('question')}")
-                logger.info(f"  Will monitor until: {self.current_market_end_time.strftime('%I:%M:%S%p ET')}")
+                logger.debug(f"Locked onto market until: {self.current_market_end_time.strftime('%I:%M:%S%p ET')}")
         else:
             self.current_market = None
             self.current_market_end_time = None
