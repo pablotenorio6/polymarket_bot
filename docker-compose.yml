@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  polymarket-bot:
+    build: .
+    container_name: polymarket-trading-bot
+    restart: unless-stopped
+    
+    # Environment variables (use .env file or set here)
+    env_file:
+      - .env
+    
+    # Or set directly (uncomment and fill):
+    # environment:
+    #   - POLYMARKET_PRIVATE_KEY=your_private_key_here
+    #   - POLYMARKET_FUNDER_ADDRESS=0x...  # Optional: if using funder mode
+    #   - SIGNATURE_TYPE=0                  # 0=EOA, 2=Browser proxy
+    
+    # Mount logs directory
+    volumes:
+      - ./logs:/app/logs
+    
+    # Keep container running and show logs
+    tty: true
+    stdin_open: true
+

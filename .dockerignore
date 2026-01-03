@@ -1,0 +1,41 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.venv
+venv
+ENV
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+
+# Logs (mounted as volume)
+logs/
+*.log
+
+# Test files
+test_*.py
+overbetted_test/
+
+# Docs
+*.md
+!requirements.txt
+
+# Other
+.DS_Store
+Thumbs.db
+
