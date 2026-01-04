@@ -284,18 +284,26 @@ class FastTrader:
         
         size_rounded = round(size, 2)
         
-        # logger.info(f"MARKET SELL: {size_rounded} shares")
+        logger.debug(f"MARKET SELL: {size_rounded} shares")
         
         try:
             # MarketOrderArgs: amount is in USD for buys, shares for sells
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=size_rounded,
-                side=SELL
+                side=SELL,
+                fee_rate_bps=0
             )
             
-            # create_market_order creates and posts in one call
-            result = self.client.create_market_order(order_args)
+            # Step 1: Create and sign the market order
+            signed_order = self.client.create_market_order(order_args)
+            
+            if not signed_order:
+                logger.error("Failed to create market order")
+                return None
+            
+            # Step 2: Post the signed order to the exchange
+            result = self.client.post_order(signed_order, OrderType.FOK)
             
             if result:
                 logger.info(f"MARKET SELL EXECUTED: {size_rounded} shares")
@@ -306,9 +314,15 @@ class FastTrader:
                         del self.active_positions[token_id]
                 
                 return result
+            else:
+                logger.warning(f"Market sell order returned empty result")
                 
         except Exception as e:
-            logger.error(f"Market sell order failed: {e}")
+            error_msg = str(e)
+            if "couldn't be fully filled" in error_msg:
+                logger.warning(f"Market sell failed: No liquidity available")
+            else:
+                logger.error(f"Market sell order failed: {e}")
         
         return None
     
