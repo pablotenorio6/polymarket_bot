@@ -70,14 +70,28 @@ class RedeemManager:
     
     def should_run(self) -> bool:
         """Check if it's time to run redeem"""
+        # Try to initialize if not done yet
         if not self.initialized:
-            return False
+            if not self.initialize():
+                return False  # Can't initialize, skip
         
         if self.last_redeem_time is None:
             return True
         
         elapsed = datetime.now() - self.last_redeem_time
         return elapsed >= timedelta(hours=REDEEM_INTERVAL_HOURS)
+    
+    def check_and_redeem(self) -> Optional[Dict]:
+        """
+        Check if redeem should run and execute if needed.
+        Convenience method for use in trading loops.
+        
+        Returns:
+            Redeem results if redeem was run, None if skipped
+        """
+        if self.should_run():
+            return self.run_redeem()
+        return None
     
     def run_redeem(self) -> Dict:
         """
