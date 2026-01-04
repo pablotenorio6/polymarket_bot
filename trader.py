@@ -303,7 +303,7 @@ class FastTrader:
                 return None
             
             # Step 2: Post the signed order to the exchange
-            result = self.client.post_order(signed_order, OrderType.FOK)
+            result = self.client.post_order(signed_order, OrderType.GTC)
             
             if result:
                 logger.info(f"MARKET SELL EXECUTED: {size_rounded} shares")
