@@ -352,8 +352,14 @@ class FastMarketMonitor:
             up_token = clob_tokens[up_idx]
             down_token = clob_tokens[down_idx]
             
-            up_price = prices.get(up_token, 0.5)
-            down_price = prices.get(down_token, 0.5)
+            up_price = prices.get(up_token)
+            down_price = prices.get(down_token)
+            
+            # Skip if we don't have valid prices - don't use fallback values
+            # that could trigger false stop losses
+            if up_price is None or down_price is None:
+                logger.debug(f"No price data for market {market_id[:10]}...")
+                continue
             
             result.append({
                 'up_price': up_price,
@@ -436,9 +442,16 @@ class FastMarketMonitorSync:
             self._async_monitor.get_prices_batch([up_token, down_token])
         )
         
+        up_price = prices.get(up_token)
+        down_price = prices.get(down_token)
+        
+        # Return None if we don't have valid prices
+        if up_price is None or down_price is None:
+            return None
+        
         return {
-            'up_price': prices.get(up_token, 0.5),
-            'down_price': prices.get(down_token, 0.5),
+            'up_price': up_price,
+            'down_price': down_price,
             'up_token_id': up_token,
             'down_token_id': down_token,
             'market': market
