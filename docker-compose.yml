@@ -8,11 +8,9 @@ services:
     env_file:
       - .env
     
-    # Or set directly (uncomment and fill):
+    # Or override with original version:
     # environment:
-    #   - POLYMARKET_PRIVATE_KEY=your_private_key_here
-    #   - POLYMARKET_FUNDER_ADDRESS=0x...  # Optional: if using funder mode
-    #   - SIGNATURE_TYPE=0                  # 0=EOA, 2=Browser proxy
+    #   - BOT_ENTRYPOINT=main.py
     
     # Mount logs directory
     volumes:

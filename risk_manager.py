@@ -1,12 +1,21 @@
 """
-Risk management and stop loss logic
+Optimized risk management for fast trading bot
+
+Key differences from original RiskManager:
+1. Dependency injection - trader passed as parameter
+2. No unnecessary imports (trader, monitor)
+3. Lighter weight initialization
+4. Thread-safe position access
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional, TYPE_CHECKING
+
 from config import STOP_LOSS_PRICE, ENABLE_STOP_LOSS, MAX_CONCURRENT_POSITIONS
-from trader import get_trader
-from monitor import MarketMonitor
+
+# Type checking only import to avoid circular deps
+if TYPE_CHECKING:
+    from trader import FastTrader
 
 logger = logging.getLogger(__name__)
 
@@ -14,25 +23,43 @@ logger = logging.getLogger(__name__)
 NO_PRICE_THRESHOLD = 10
 
 
-class RiskManager:
+class FastRiskManager:
     """
-    Manages risk including stop losses and position limits
+    Lightweight risk manager for use with FastTrader
+    
+    Features:
+    - No external dependencies (trader injected)
+    - Stop loss via price monitoring
+    - Position limit enforcement
+    - Resolved market detection
     """
     
-    def __init__(self):
-        self.trader = get_trader()
-        self.monitor = MarketMonitor()
-        self.stop_losses = {}  # token_id -> stop loss price
-        self.no_price_count = {}  # Track consecutive no-price cycles per token
+    def __init__(self, trader: 'FastTrader'):
+        """
+        Initialize with a trader instance
+        
+        Args:
+            trader: FastTrader instance to use for order execution
+        """
+        self.trader = trader
+        self.stop_losses: Dict[str, float] = {}  # token_id -> stop price
+        self.no_price_count: Dict[str, int] = {}  # Track consecutive no-price cycles
     
     def set_stop_loss(self, token_id: str, stop_price: float):
-        """Set a stop loss for a position"""
+        """Set a stop loss price for a position"""
         self.stop_losses[token_id] = stop_price
-        logger.info(f"Stop loss set for {token_id[:10]}... at ${stop_price:.3f}")
+        logger.debug(f"Stop loss set for {token_id[:10]}... at ${stop_price:.3f}")
+    
+    def remove_stop_loss(self, token_id: str):
+        """Remove a stop loss"""
+        if token_id in self.stop_losses:
+            del self.stop_losses[token_id]
+        if token_id in self.no_price_count:
+            del self.no_price_count[token_id]
     
     def check_stop_losses(self, current_prices: Dict[str, float]):
         """
-        Check if any positions have hit their stop loss
+        Check all positions against their stop losses
         
         Args:
             current_prices: Dict of token_id -> current_price
@@ -42,89 +69,83 @@ class RiskManager:
         
         positions = self.trader.get_all_positions()
         
-        for token_id, position in positions.items():
-            if token_id not in self.stop_losses:
-                # Set default stop loss if not set
-                self.set_stop_loss(token_id, STOP_LOSS_PRICE)
+        # Process each position
+        tokens_to_process = list(positions.keys())
+        
+        for token_id in tokens_to_process:
+            position = positions.get(token_id)
+            if not position:
                 continue
+            
+            # Ensure stop loss is set
+            if token_id not in self.stop_losses:
+                self.set_stop_loss(token_id, STOP_LOSS_PRICE)
             
             current_price = current_prices.get(token_id)
+            
             if current_price is None:
-                # Track consecutive no-price cycles
-                self.no_price_count[token_id] = self.no_price_count.get(token_id, 0) + 1
-                
-                if self.no_price_count[token_id] >= NO_PRICE_THRESHOLD:
-                    # Market likely resolved - clean up position
-                    logger.info(f"Market resolved for {position['side']} position - cleaning up")
-                    self._cleanup_resolved_position(token_id)
-                elif self.no_price_count[token_id] == 1:
-                    # Only log first occurrence
-                    logger.debug(f"No price data for {token_id[:10]}...")
+                self._handle_no_price(token_id, position)
                 continue
             
-            # Reset counter if we got price data
+            # Reset counter on valid price
             self.no_price_count[token_id] = 0
             
+            # Check stop loss trigger
             stop_price = self.stop_losses[token_id]
             
-            # Check if stop loss triggered
             if current_price <= stop_price:
-                logger.warning(f"STOP LOSS TRIGGERED for {position['side']}")
-                logger.warning(f"  Current: ${current_price:.3f} <= Stop: ${stop_price:.3f}")
-                
-                # Execute stop loss
                 self._execute_stop_loss(token_id, position, current_price)
+    
+    def _handle_no_price(self, token_id: str, position: Dict):
+        """Handle case when no price data is available"""
+        self.no_price_count[token_id] = self.no_price_count.get(token_id, 0) + 1
+        
+        if self.no_price_count[token_id] >= NO_PRICE_THRESHOLD:
+            # Market likely resolved
+            logger.info(f"Market resolved for {position['side']} position - cleaning up")
+            self._cleanup_resolved_position(token_id)
+        elif self.no_price_count[token_id] == 1:
+            logger.debug(f"No price data for {token_id[:10]}...")
     
     def _execute_stop_loss(self, token_id: str, position: Dict, current_price: float):
         """Execute a stop loss sell order"""
         try:
-            size = position['size']
+            shares = position.get('shares', position.get('size', 0))
             entry_price = position['entry_price']
+            side = position['side']
             
-            logger.info(f"Executing stop loss sell for {size:.2f} shares")
+            logger.warning(f"STOP LOSS TRIGGERED for {side.upper()}")
+            logger.warning(f"  Current: ${current_price:.3f} <= Stop: ${self.stop_losses[token_id]:.3f}")
             
-            # Place sell order at current market price (or slightly below)
-            sell_price = max(current_price - 0.01, 0.01)  # Don't sell below 0.01
-            
+            # Sell at stop loss price (GTC order stays in book)
             order = self.trader.place_sell_order(
                 token_id=token_id,
-                price=sell_price,
-                size=size
+                price=self.stop_losses[token_id],
+                size=shares,
+                order_type="GTC"
             )
             
             if order:
-                loss = (sell_price - entry_price) * size
-                logger.warning(f"STOP LOSS EXECUTED | Loss: ${loss:.2f}")
-                
-                # Remove stop loss
-                if token_id in self.stop_losses:
-                    del self.stop_losses[token_id]
+                stop_price = self.stop_losses[token_id]
+                loss = (stop_price - entry_price) * shares
+                logger.warning(f"STOP LOSS ORDER PLACED @ ${stop_price:.2f} | Est. Loss: ${loss:.2f}")
+                self.remove_stop_loss(token_id)
             else:
-                logger.error("Failed to execute stop loss order!")
+                logger.error("Stop loss order failed - will retry next cycle")
                 
         except Exception as e:
             logger.error(f"Error executing stop loss: {e}")
     
     def _cleanup_resolved_position(self, token_id: str):
-        """
-        Clean up a position from a resolved market.
-        The shares will need to be redeemed from Polymarket web interface.
-        """
+        """Clean up position from resolved market"""
         try:
-            # Remove from active positions
-            if token_id in self.trader.active_positions:
-                position = self.trader.active_positions.pop(token_id)
-                logger.info(f"Removed {position['side']} position from tracking (market resolved)")
-                logger.info("  -> Redeem your winnings from Polymarket web interface")
+            # Remove from trader's active positions
+            self.trader.remove_position(token_id)
+            logger.info("  -> Redeem winnings from Polymarket or wait for auto-redeem")
             
-            # Remove stop loss
-            if token_id in self.stop_losses:
-                del self.stop_losses[token_id]
+            # Clean up our tracking
+            self.remove_stop_loss(token_id)
             
-            # Clean up counter
-            if token_id in self.no_price_count:
-                del self.no_price_count[token_id]
-                
         except Exception as e:
             logger.error(f"Error cleaning up resolved position: {e}")
     
@@ -135,89 +156,60 @@ class RiskManager:
         take_profit_price: float = 0.99
     ) -> bool:
         """
-        Check if position has reached take profit target (OPTIONAL)
+        Check if position has reached take profit target
         
-        Note: In prediction markets, you can hold until resolution to get $1.00 per share.
-        Take profit is only useful if you want to lock in gains early.
-        
-        Args:
-            token_id: Token ID
-            current_price: Current price
-            take_profit_price: Price to take profit (default 0.99)
-        
-        Returns:
-            True if take profit executed
+        Note: Usually better to hold until resolution for $1.00/share
         """
         position = self.trader.get_position(token_id)
         if not position:
             return False
         
         if current_price >= take_profit_price:
-            logger.info(f"TAKE PROFIT OPPORTUNITY at ${current_price:.3f}")
-            logger.info(f"  (Can also hold to resolution for $1.00)")
+            shares = position.get('shares', position.get('size', 0))
             
-            # Execute sell
+            logger.info(f"TAKE PROFIT at ${current_price:.3f}")
+            
             order = self.trader.place_sell_order(
                 token_id=token_id,
                 price=current_price,
-                size=position['size']
+                size=shares,
+                order_type="FOK"
             )
             
             if order:
-                profit = (current_price - position['entry_price']) * position['size']
+                profit = (current_price - position['entry_price']) * shares
                 logger.info(f"TAKE PROFIT EXECUTED | Profit: ${profit:+.2f}")
-                
-                # Remove stop loss
-                if token_id in self.stop_losses:
-                    del self.stop_losses[token_id]
-                
+                self.remove_stop_loss(token_id)
                 return True
         
         return False
     
     def can_open_new_position(self) -> bool:
-        """Check if we can open a new position based on limits"""
+        """Check if we can open a new position"""
         current_positions = len(self.trader.get_all_positions())
         
         if current_positions >= MAX_CONCURRENT_POSITIONS:
-            logger.debug(f"Max positions reached ({current_positions}/{MAX_CONCURRENT_POSITIONS})")
+            logger.debug(f"Max positions ({current_positions}/{MAX_CONCURRENT_POSITIONS})")
             return False
         
         return True
     
     def get_position_summary(self) -> str:
-        """Get a summary of all positions and their P&L"""
+        """Get summary of all positions"""
         positions = self.trader.get_all_positions()
         
         if not positions:
-            return "No open positions"
+            return ""
         
-        summary = f"\n{'='*60}\n"
-        summary += f"OPEN POSITIONS ({len(positions)}):\n"
-        summary += f"{'='*60}\n"
+        lines = [f"Positions ({len(positions)}):"]
         
         for token_id, pos in positions.items():
             side = pos['side']
             entry = pos['entry_price']
-            size = pos['size']
-            stop = self.stop_losses.get(token_id, 'Not set')
+            shares = pos.get('shares', pos.get('size', 0))
+            stop = self.stop_losses.get(token_id, STOP_LOSS_PRICE)
             
-            summary += f"\n  {side} | Entry: ${entry:.3f} | Size: {size:.2f} shares\n"
-            summary += f"  Stop Loss: ${stop:.3f}\n" if isinstance(stop, float) else f"  Stop Loss: {stop}\n"
-            summary += f"  Market: {pos['market'].get('question', '')[:50]}...\n"
+            lines.append(f"  {side.upper()} {shares:.2f}@${entry:.2f} | Stop: ${stop:.2f}")
         
-        summary += f"{'='*60}\n"
-        return summary
-
-
-# Singleton instance
-_risk_manager_instance: Optional[RiskManager] = None
-
-
-def get_risk_manager() -> RiskManager:
-    """Get the singleton risk manager instance"""
-    global _risk_manager_instance
-    if _risk_manager_instance is None:
-        _risk_manager_instance = RiskManager()
-    return _risk_manager_instance
+        return " | ".join(lines)
 

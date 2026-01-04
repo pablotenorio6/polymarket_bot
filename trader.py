@@ -1,115 +1,198 @@
 """
-Trading logic for placing orders on Polymarket
+Optimized trader with pre-signed orders and minimal latency
+
+Key optimizations:
+1. Pre-signed order templates ready to post
+2. Client connection kept warm
+3. Minimal processing between decision and execution
+4. Async order submission for non-blocking trades
 """
 
+import asyncio
+import httpx
+import json
 import logging
-from typing import Dict, Optional
-from decimal import Decimal
-from config import ORDER_PRICE, MAX_POSITION_SIZE
+import time
+from typing import Dict, Optional, List
+from decimal import Decimal, ROUND_DOWN
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
+
+from config import CHAIN_ID, CLOB_API
 from auth import get_auth
 
 logger = logging.getLogger(__name__)
 
+# Thread pool for async order submission
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="trader")
 
-class PolymarketTrader:
+
+class FastTrader:
     """
-    Handles order placement and position management
+    High-performance trader optimized for minimal latency
+    
+    Key features:
+    - Pre-initialized and warmed-up client connection
+    - Optimized share calculation (no iterations)
+    - Async order posting (non-blocking)
+    - Position tracking in memory (no API calls)
     """
     
     def __init__(self):
-        self.auth = get_auth()
-        self.client = None
-        self.active_positions = {}  # token_id -> position info
+        self.client: Optional[ClobClient] = None
+        self.signer_address: Optional[str] = None
+        self.funder_address: Optional[str] = None
+        
+        # Position tracking
+        self.active_positions: Dict[str, Dict] = {}  # token_id -> position data
+        self._position_lock = threading.Lock()
+        
+        # Pre-computed tick sizes by market
+        self.tick_sizes: Dict[str, str] = {}
+        
+        # Connection warmup tracking
+        self._last_warmup = 0
+        self._warmup_interval = 60  # seconds
+        
+        # Initialize client
+        self._initialize()
     
-    def initialize(self):
-        """Initialize the trading client"""
+    def _initialize(self):
+        """Initialize and warm up the trading client"""
+        auth = get_auth()
         try:
-            self.client = self.auth.get_client()
-            logger.debug("Trader initialized successfully")
+            self.client = auth.get_client()
+            if self.client:
+                self.signer_address = self.client.get_address()
+                self.funder_address = auth.funder_address
+                
+                logger.info(f"FastTrader initialized | Signer: {self.signer_address[:10]}...")
+                if self.funder_address:
+                    logger.info(f"Funder mode: {self.funder_address[:10]}...")
+                
+                # Warm up connection
+                self._warmup_connection()
         except Exception as e:
-            logger.error(f"Failed to initialize trader: {e}")
-            raise
+            logger.warning(f"Could not initialize trader: {e}")
+    
+    def _warmup_connection(self):
+        """Keep the connection warm with a lightweight request"""
+        if not self.client:
+            return
+        
+        now = time.time()
+        if now - self._last_warmup < self._warmup_interval:
+            return
+        
+        try:
+            # Lightweight call to keep connection alive
+            self.client.get_ok()
+            self._last_warmup = now
+            logger.debug("Connection warmed up")
+        except Exception as e:
+            logger.debug(f"Warmup failed: {e}")
+    
+    def _get_tick_size(self, token_id: str) -> str:
+        """Get tick size for a token, with caching"""
+        if token_id in self.tick_sizes:
+            return self.tick_sizes[token_id]
+        
+        # Default to 0.01 for BTC markets
+        tick_size = "0.01"
+        
+        if self.client:
+            try:
+                ts = self.client.get_tick_size(token_id)
+                if ts:
+                    tick_size = ts
+            except:
+                pass
+        
+        self.tick_sizes[token_id] = tick_size
+        return tick_size
+
     
     def place_buy_order(
         self,
         token_id: str,
-        side: str,  # "UP" or "DOWN"
+        side: str,  # 'up' or 'down'
         price: float,
         size: float,
-        market_info: Dict
+        market_info: Dict,
+        order_type: str = "FOK"
     ) -> Optional[Dict]:
         """
-        Place a fill-or-kill buy order
+        Place a buy order with minimal latency
         
         Args:
-            token_id: The token ID to buy
-            side: "UP" or "DOWN"
-            price: Price willing to pay (e.g., 0.97)
+            token_id: Token to buy
+            side: 'up' or 'down' (for logging)
+            price: Price per share
             size: Amount in USD to spend
-            market_info: Market information dict
+            market_info: Market metadata
+            order_type: FOK or GTC
         
         Returns:
-            Order result dict or None if failed
+            Order response or None
         """
         if not self.client:
-            logger.error("Client not initialized. Call initialize() first.")
+            logger.warning("Client not initialized")
             return None
         
+        # Warm up connection if needed
+        self._warmup_connection()
+        
+        # Round price
+        price_rounded = round(price, 2)
+        
+        tick_size = self._get_tick_size(token_id)
+        
+        logger.debug(f"BUY {side.upper()}: {size} shares @ ${price_rounded} (${size:.2f} total)")
+        
         try:
-            logger.debug(f"Attempting to BUY {side} at ${price:.3f} for ${size:.2f}")
-            
-            # Calculate shares to buy
-            # shares = size / price
-            shares = size / price
-            
-            # Create order using py-clob-client
-            # Step 1: Create and sign the order
-            from py_clob_client.order_builder.constants import BUY
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            
+            # Create order args
             order_args = OrderArgs(
                 token_id=token_id,
-                price=price,
+                price=price_rounded,
                 size=size,
                 side=BUY,
-                fee_rate_bps=0,  # Fee rate in basis points
-                nonce=0  # Will be auto-generated if 0
+                fee_rate_bps=0
             )
             
-            # Create and sign the order
+            # Sign order
             signed_order = self.client.create_order(order_args)
             
-            # Step 2: Post the order to the exchange with FOK time in force
-            order = self.client.post_order(signed_order, orderType=OrderType.FOK)
+            # Post order
+            py_order_type = OrderType.FOK if order_type == "FOK" else OrderType.GTC
+            result = self.client.post_order(signed_order, orderType=py_order_type)
             
-            if order:
-                order_id = order.get('id', 'N/A')[:16] if order.get('id') else 'matched'
+            if result:
+                logger.info(f"ORDER FILLED: BUY {side.upper()} {size} @ ${price_rounded}")
                 
-                # Calculate actual shares bought (size parameter is shares for BUY)
-                shares_bought = size  # py-clob-client uses size as shares
-                cost_usd = shares_bought * price
+                # Track position
+                with self._position_lock:
+                    self.active_positions[token_id] = {
+                        'side': side,
+                        'shares': size,
+                        'entry_price': price_rounded,
+                        'entry_time': time.time(),
+                        'market': market_info
+                    }
                 
-                logger.info(f"BUY ORDER FILLED: {side} | {shares_bought:.2f} shares @ ${price:.2f} = ${cost_usd:.2f}")
-                
-                # Track position with SHARES (not USD)
-                self.active_positions[token_id] = {
-                    'side': side,
-                    'entry_price': price,
-                    'size': shares_bought,  # This is shares, not USD
-                    'cost_usd': cost_usd,
-                    'market': market_info,
-                    'order_id': order.get('id'),
-                    'timestamp': order.get('timestamp')
-                }
-                
-                return order
-            else:
-                logger.warning("Order not filled (FOK rejected)")
-                return None
+                return result
                 
         except Exception as e:
-            logger.error(f"Error placing order: {e}")
-            return None
+            error_msg = str(e)
+            if "not enough balance" in error_msg.lower():
+                logger.error("Insufficient USDC balance or allowance")
+            else:
+                logger.error(f"Order failed: {e}")
+        
+        return None
     
     def place_sell_order(
         self,
@@ -119,115 +202,194 @@ class PolymarketTrader:
         order_type: str = "FOK"
     ) -> Optional[Dict]:
         """
-        Place a sell order to close position
+        Place a sell order (for stop loss or take profit)
         
         Args:
-            token_id: The token ID to sell
-            price: Price to sell at
+            token_id: Token to sell
+            price: Price per share
             size: Number of shares to sell
-            order_type: Order type - "FOK" (Fill or Kill) or "GTC" (Good Till Canceled)
-        
-        Returns:
-            Order result dict or None if failed
+            order_type: FOK (immediate) or GTC (resting)
         """
         if not self.client:
-            logger.error("Client not initialized")
             return None
+        
+        price_rounded = round(price, 2)
+        size_rounded = round(size, 2)
+        
+        tick_size = self._get_tick_size(token_id)
+        
+        logger.debug(f"SELL: {size_rounded} shares @ ${price_rounded}")
         
         try:
-            logger.debug(f"Attempting to SELL {size:.2f} shares at ${price:.3f} ({order_type})")
-            
-            from py_clob_client.order_builder.constants import SELL
-            from py_clob_client.clob_types import OrderArgs, OrderType
-            
             order_args = OrderArgs(
                 token_id=token_id,
-                price=price,
-                size=size,
+                price=price_rounded,
+                size=size_rounded,
                 side=SELL,
-                fee_rate_bps=0,
-                nonce=0
+                fee_rate_bps=0
             )
+            
             signed_order = self.client.create_order(order_args)
-
-            # Select order type
-            ot = OrderType.GTC if order_type == "GTC" else OrderType.FOK
-            order = self.client.post_order(signed_order, orderType=ot)
-
-            if order:
-                order_id = order.get('id', 'N/A')[:16]
+            py_order_type = OrderType.FOK if order_type == "FOK" else OrderType.GTC
+            result = self.client.post_order(signed_order, orderType=py_order_type)
+            
+            if result:
+                logger.info(f"SOLD: {size_rounded} shares @ ${price_rounded}")
                 
-                # Remove from active positions only if it's a FOK order (immediate)
-                # GTC orders (stop loss) don't remove the position yet
-                if order_type == "FOK" and token_id in self.active_positions:
-                    position = self.active_positions.pop(token_id)
-                    entry_price = position['entry_price']
-                    pnl = (price - entry_price) * size
-                    logger.info(f"SELL ORDER FILLED @ ${price:.2f} | P&L: ${pnl:+.2f}")
-                else:
-                    logger.debug(f"Sell order placed (GTC): {order_id}...")
+                # Remove from tracked positions
+                with self._position_lock:
+                    if token_id in self.active_positions:
+                        del self.active_positions[token_id]
                 
-                return order
-            else:
-                logger.warning(f"Sell order not filled ({order_type})")
-                return None
+                return result
                 
         except Exception as e:
-            logger.error(f"Error placing sell order: {e}")
-            return None
+            logger.error(f"Sell order failed: {e}")
+        
+        return None
+    
+    def place_sell_order_async(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        order_type: str = "FOK"
+    ):
+        """
+        Non-blocking sell order submission
+        
+        Returns immediately, order is placed in background
+        """
+        _executor.submit(
+            self.place_sell_order,
+            token_id, price, size, order_type
+        )
     
     def get_position(self, token_id: str) -> Optional[Dict]:
-        """Get info about an active position"""
-        return self.active_positions.get(token_id)
+        """Get position for a token from local cache"""
+        with self._position_lock:
+            return self.active_positions.get(token_id)
     
-    def has_position(self, token_id: str) -> bool:
-        """Check if we have an open position for this token"""
-        return token_id in self.active_positions
+    def get_all_positions(self) -> Dict[str, Dict]:
+        """Get all tracked positions"""
+        with self._position_lock:
+            return dict(self.active_positions)
     
-    def get_all_positions(self) -> Dict:
-        """Get all active positions"""
-        return self.active_positions.copy()
+    def remove_position(self, token_id: str):
+        """Remove a position from tracking"""
+        with self._position_lock:
+            if token_id in self.active_positions:
+                del self.active_positions[token_id]
     
-    def should_enter_trade(
-        self,
-        current_side_price: float,
-        trigger_price: float,
-        token_id: str
-    ) -> bool:
+    def should_enter_trade(self, price: float, trigger_price: float) -> bool:
+        """Check if price meets entry criteria"""
+        return price >= trigger_price
+    
+    def get_trade_side(self, up_price: float, down_price: float, trigger_price: float) -> Optional[str]:
         """
-        Determine if we should enter a trade
+        Determine which side to trade based on prices
         
-        Logic: If this side reaches trigger_price (0.96),
-        we buy THIS SAME side at ORDER_PRICE (0.97) expecting it to reach 0.99+
-        
-        Args:
-            current_side_price: Current price of this side
-            trigger_price: Price threshold to trigger trade (e.g., 0.96)
-            token_id: Token we would buy
-        
-        Returns:
-            True if we should enter trade
+        Returns 'up', 'down', or None
         """
-        # Don't enter if we already have a position
-        if self.has_position(token_id):
-            return False
+        if up_price >= trigger_price:
+            return 'up'
+        elif down_price >= trigger_price:
+            return 'down'
+        return None
+
+
+class PreSignedOrderCache:
+    """
+    Cache for pre-signed orders to minimize latency at execution time
+    
+    Pre-signs orders for common price points so execution only
+    requires posting, not signing
+    """
+    
+    def __init__(self, trader: FastTrader, token_id: str, size: float):
+        self.trader = trader
+        self.token_id = token_id
+        self.size = size
         
-        # Check if this side has reached trigger price
-        if current_side_price >= trigger_price:
-            logger.info(f"TRIGGER: This side at ${current_side_price:.3f} >= ${trigger_price:.3f}")
-            return True
+        # Cache of pre-signed orders: price -> signed_order
+        self.buy_orders: Dict[float, object] = {}
+        self.sell_orders: Dict[float, object] = {}
         
-        return False
-
-
-# Singleton instance
-_trader_instance: Optional[PolymarketTrader] = None
-
-
-def get_trader() -> PolymarketTrader:
-    """Get the singleton trader instance"""
-    global _trader_instance
-    if _trader_instance is None:
-        _trader_instance = PolymarketTrader()
-    return _trader_instance
+        # Price points to pre-sign
+        self.buy_prices = [0.95, 0.96, 0.97, 0.98, 0.99]
+        self.sell_prices = [0.80, 0.85, 0.90]
+    
+    def warm_up(self):
+        """Pre-sign orders for all configured price points"""
+        if not self.trader.client:
+            return
+        
+        tick_size = self.trader._get_tick_size(self.token_id)
+        
+        # Pre-sign buy orders
+        for price in self.buy_prices:
+            shares = self.trader.calculate_shares_fast(self.size, price)
+            if shares > 0:
+                try:
+                    order_args = OrderArgs(
+                        token_id=self.token_id,
+                        price=price,
+                        size=shares,
+                        side=BUY,
+                        fee_rate_bps=0
+                    )
+                    self.buy_orders[price] = self.trader.client.create_order(order_args)
+                except Exception as e:
+                    logger.debug(f"Failed to pre-sign buy @ {price}: {e}")
+        
+        # Pre-sign sell orders
+        position = self.trader.get_position(self.token_id)
+        if position:
+            for price in self.sell_prices:
+                try:
+                    order_args = OrderArgs(
+                        token_id=self.token_id,
+                        price=price,
+                        size=position['shares'],
+                        side=SELL,
+                        fee_rate_bps=0
+                    )
+                    self.sell_orders[price] = self.trader.client.create_order(order_args)
+                except Exception as e:
+                    logger.debug(f"Failed to pre-sign sell @ {price}: {e}")
+    
+    def execute_buy(self, price: float) -> Optional[Dict]:
+        """Execute a pre-signed buy order if available"""
+        if price in self.buy_orders:
+            try:
+                return self.trader.client.post_order(
+                    self.buy_orders[price],
+                    orderType=OrderType.FOK
+                )
+            except:
+                pass
+        
+        # Fallback to regular order
+        return self.trader.place_buy_order(
+            self.token_id, 'cached', price, self.size, {}
+        )
+    
+    def execute_sell(self, price: float) -> Optional[Dict]:
+        """Execute a pre-signed sell order if available"""
+        if price in self.sell_orders:
+            try:
+                return self.trader.client.post_order(
+                    self.sell_orders[price],
+                    orderType=OrderType.FOK
+                )
+            except:
+                pass
+        
+        # Fallback to regular order
+        position = self.trader.get_position(self.token_id)
+        if position:
+            return self.trader.place_sell_order(
+                self.token_id, price, position['shares']
+            )
+        return None
 

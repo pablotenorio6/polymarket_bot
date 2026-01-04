@@ -25,6 +25,11 @@ COPY *.py ./
 # Create logs directory
 RUN mkdir -p /app/logs
 
+# Entry point (choose between main.py or main_fast.py)
+# main.py = Original synchronous version
+# main_fast.py = Optimized async version (recommended)
+ENV BOT_ENTRYPOINT=main.py
+
 # Default command
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "python $BOT_ENTRYPOINT"]
 
