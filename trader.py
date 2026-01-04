@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from config import CHAIN_ID, CLOB_API
@@ -264,6 +264,53 @@ class FastTrader:
             self.place_sell_order,
             token_id, price, size, order_type
         )
+    
+    def place_market_sell_order(
+        self,
+        token_id: str,
+        size: float
+    ) -> Optional[Dict]:
+        """
+        Place a market sell order (immediate execution at best available price)
+        
+        Used for stop loss to guarantee execution regardless of price.
+        
+        Args:
+            token_id: Token to sell
+            size: Number of shares to sell
+        """
+        if not self.client:
+            return None
+        
+        size_rounded = round(size, 2)
+        
+        # logger.info(f"MARKET SELL: {size_rounded} shares")
+        
+        try:
+            # MarketOrderArgs: amount is in USD for buys, shares for sells
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=size_rounded,
+                side=SELL
+            )
+            
+            # create_market_order creates and posts in one call
+            result = self.client.create_market_order(order_args)
+            
+            if result:
+                logger.info(f"MARKET SELL EXECUTED: {size_rounded} shares")
+                
+                # Remove from tracked positions
+                with self._position_lock:
+                    if token_id in self.active_positions:
+                        del self.active_positions[token_id]
+                
+                return result
+                
+        except Exception as e:
+            logger.error(f"Market sell order failed: {e}")
+        
+        return None
     
     def get_position(self, token_id: str) -> Optional[Dict]:
         """Get position for a token from local cache"""
