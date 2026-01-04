@@ -6,6 +6,10 @@ requests>=2.31.0
 # Polymarket official client (required for trading)
 py-clob-client>=0.17.0
 
+# Polymarket community APIs (for redeem functionality)
+# Requires Python 3.12+
+polymarket_apis>=0.4.0
+
 # Web3 dependencies (required by py-clob-client)
 web3>=6.0.0
 eth-account>=0.9.0

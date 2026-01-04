@@ -43,6 +43,7 @@ from monitor import MarketMonitor
 from trader import get_trader
 from risk_manager import get_risk_manager
 from auth import get_auth
+from redeem import run_redeem_if_needed
 
 
 class TradingBot:
@@ -118,6 +119,11 @@ class TradingBot:
             
             # Check stop losses and take profits for existing positions
             self._manage_positions(all_prices)
+            
+            # Periodically redeem winnings from resolved markets (every hour)
+            redeem_result = run_redeem_if_needed()
+            if redeem_result and redeem_result['positions_redeemed'] > 0:
+                logger.info(f"AUTO-REDEEMED: ${redeem_result['total_value']:.2f} from {redeem_result['positions_redeemed']} positions")
             
         except Exception as e:
             logger.error(f"Error in trading loop: {e}", exc_info=True)
