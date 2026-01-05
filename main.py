@@ -134,13 +134,13 @@ class FastTradingBot:
             self.total_latency += latency
             
             # Removed continuous loop stats - only execution latency when orders trigger
-            if self.loop_count % 5000 == 0:
-                # Small sleep to prevent CPU hogging
-                await asyncio.sleep(0)  # 0.01ms sleep
+            # if self.loop_count % 5000 == 0:
+            #     # Small sleep to prevent CPU hogging
+            await asyncio.sleep(0.0001)  # 0.1ms sleep
 
-            # if self.loop_count % 10000000 == 0:
-            #     avg_latency = self.total_latency / self.loop_count
-            #     logger.info(f"Loop stats: {self.loop_count} iterations, avg {avg_latency*1000:.1f}ms")
+            if self.loop_count % 10000 == 0:
+                avg_latency = self.total_latency / self.loop_count
+                logger.info(f"Loop stats: {self.loop_count} iterations, avg {avg_latency*1000:.1f}ms")
 
         await self.shutdown()
     
