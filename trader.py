@@ -231,12 +231,20 @@ class FastTrader:
         # Try pre-signed order first (FAST PATH)
         if key in self.presigned_buys:
             try:
+                # START PROFILING: Measure execution latency from trigger detection
+                trigger_start_time = time.perf_counter()
+                
                 py_order_type = OrderType.FOK if order_type == "FOK" else OrderType.GTC
                 result = self.client.post_order(self.presigned_buys[key], orderType=py_order_type)
                 
                 if result:
                     logger.info(f"ORDER FILLED (pre-signed): BUY {side.upper()} {size} @ ${price_rounded}")
-                    
+
+                    # END PROFILING: Log execution latency
+                    trigger_end_time = time.perf_counter()
+                    execution_latency = (trigger_end_time - trigger_start_time) * 1000
+                    logger.info(f"ORDER FILLED EXECUTION LATENCY: {execution_latency:.2f}ms")
+
                     # Track position
                     with self._position_lock:
                         self.active_positions[token_id] = {

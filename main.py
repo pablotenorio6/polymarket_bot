@@ -308,8 +308,7 @@ class FastTradingBot:
         
         if trade_side:
             # TRIGGER HIT - Execute immediately using PRE-SIGNED order
-            # START PROFILING: Measure execution latency from trigger detection
-            trigger_start_time = time.perf_counter()
+
 
             token_id = up_token if trade_side == 'up' else down_token
             current_price = up_price if trade_side == 'up' else down_price
@@ -329,15 +328,7 @@ class FastTradingBot:
                 order_type="FOK"
             )
 
-            # END PROFILING: Log execution latency
-            trigger_end_time = time.perf_counter()
-            execution_latency = (trigger_end_time - trigger_start_time) * 1000
-
-            if order:
-                logger.info(f"EXECUTION LATENCY: {execution_latency:.2f}ms | {trade_side.upper()} @ ${current_price:.4f}")
-            else:
-                logger.warning(f"EXECUTION LATENCY: {execution_latency:.2f}ms | {trade_side.upper()} @ ${current_price:.4f} FAILED")
-            
+           
             if order:
                 if ENABLE_STOP_LOSS:
                     self.risk_manager.set_stop_loss(token_id, STOP_LOSS_PRICE)
