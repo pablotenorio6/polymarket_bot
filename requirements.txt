@@ -25,3 +25,6 @@ pytz>=2023.3  # For timezone handling
 # WebSocket for real-time price updates
 websockets>=12.0
 
+# Fast JSON parsing (5-10x faster than stdlib json)
+orjson>=3.9.0
+
