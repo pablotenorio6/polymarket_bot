@@ -108,25 +108,21 @@ class FastRiskManager:
             logger.debug(f"No price data for {token_id[:10]}...")
     
     def _execute_stop_loss(self, token_id: str, position: Dict, current_price: float):
-        """Execute a stop loss market sell order"""
+        """Execute a stop loss market sell order using PRE-SIGNED order if available"""
         try:
             shares = position.get('shares', position.get('size', 0))
             entry_price = position['entry_price']
             side = position['side']
             
-            # logger.warning(f"STOP LOSS TRIGGERED for {side.upper()}")
-            # logger.warning(f"  Current: ${current_price:.3f} <= Stop: ${self.stop_losses[token_id]:.3f}")
+            logger.warning(f"STOP LOSS TRIGGERED for {side.upper()} @ ${current_price:.3f}")
             
-            # Market order - sells at best available price
-            order = self.trader.place_market_sell_order(
-                token_id=token_id,
-                size=shares
-            )
+            # Try PRE-SIGNED order first (FAST PATH)
+            order = self.trader.execute_presigned_stop_loss(token_id)
             
             if order:
                 # Estimate loss based on current price
                 est_loss = (current_price - entry_price) * shares
-                logger.warning(f"STOP LOSS EXECUTED (market order) | Est. Loss: ${est_loss:.2f}")
+                logger.warning(f"STOP LOSS EXECUTED | Est. Loss: ${est_loss:.2f}")
                 self.remove_stop_loss(token_id)
             else:
                 logger.error("Stop loss order failed - will retry next cycle")

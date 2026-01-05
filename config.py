@@ -19,7 +19,7 @@ MAX_POSITION_SIZE = 5  # Maximum USD to risk per trade
 # ============================================
 # MONITORING & PERFORMANCE
 # ============================================
-POLL_INTERVAL = 0.1  # Seconds between price checks (100ms)
+POLL_INTERVAL = 0.05  # Seconds between price checks (100ms)
 REQUEST_TIMEOUT = 5  # HTTP request timeout
 
 # Rate limit safety (based on Polymarket API limits)

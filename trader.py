@@ -37,7 +37,7 @@ class FastTrader:
     
     Key features:
     - Pre-initialized and warmed-up client connection
-    - Optimized share calculation (no iterations)
+    - PRE-SIGNED ORDERS for instant execution
     - Async order posting (non-blocking)
     - Position tracking in memory (no API calls)
     """
@@ -53,6 +53,14 @@ class FastTrader:
         
         # Pre-computed tick sizes by market
         self.tick_sizes: Dict[str, str] = {}
+        
+        # === PRE-SIGNED ORDERS CACHE ===
+        # Buy orders: (token_id, price) -> signed_order
+        self.presigned_buys: Dict[tuple, object] = {}
+        # Sell orders: token_id -> signed_order (for stop loss)
+        self.presigned_sells: Dict[str, object] = {}
+        # Track which market we have pre-signed orders for
+        self.presigned_market_id: Optional[str] = None
         
         # Connection warmup tracking
         self._last_warmup = 0
@@ -115,6 +123,183 @@ class FastTrader:
         self.tick_sizes[token_id] = tick_size
         return tick_size
 
+    # =========================================
+    # PRE-SIGNED ORDERS (Low Latency Trading)
+    # =========================================
+    
+    def presign_buy_orders(
+        self,
+        up_token_id: str,
+        down_token_id: str,
+        price: float,
+        size: float,
+        market_id: str
+    ):
+        """
+        Pre-sign buy orders for both UP and DOWN outcomes.
+        Call this when a new market is detected to have orders ready.
+        
+        Args:
+            up_token_id: Token ID for UP outcome
+            down_token_id: Token ID for DOWN outcome  
+            price: Entry price (e.g. 0.97)
+            size: Position size in shares
+            market_id: Market identifier to track freshness
+        """
+        if not self.client:
+            return
+        
+        # Clear old pre-signed orders if market changed
+        if market_id != self.presigned_market_id:
+            self.presigned_buys.clear()
+            self.presigned_sells.clear()
+            self.presigned_market_id = market_id
+        
+        price_rounded = round(price, 2)
+        
+        # Pre-sign UP buy order
+        try:
+            up_args = OrderArgs(
+                token_id=up_token_id,
+                price=price_rounded,
+                size=size,
+                side=BUY,
+                fee_rate_bps=0
+            )
+            self.presigned_buys[(up_token_id, price_rounded)] = self.client.create_order(up_args)
+            logger.debug(f"Pre-signed BUY UP @ ${price_rounded}")
+        except Exception as e:
+            logger.debug(f"Failed to pre-sign UP buy: {e}")
+        
+        # Pre-sign DOWN buy order
+        try:
+            down_args = OrderArgs(
+                token_id=down_token_id,
+                price=price_rounded,
+                size=size,
+                side=BUY,
+                fee_rate_bps=0
+            )
+            self.presigned_buys[(down_token_id, price_rounded)] = self.client.create_order(down_args)
+            logger.debug(f"Pre-signed BUY DOWN @ ${price_rounded}")
+        except Exception as e:
+            logger.debug(f"Failed to pre-sign DOWN buy: {e}")
+    
+    def presign_stop_loss(self, token_id: str, shares: float):
+        """
+        Pre-sign a market sell order for stop loss.
+        Call this immediately after a buy order fills.
+        
+        Args:
+            token_id: Token to sell
+            shares: Number of shares to sell
+        """
+        if not self.client:
+            return
+        
+        try:
+            # Pre-sign market sell order
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=round(shares, 2),
+                side=SELL,
+                fee_rate_bps=0
+            )
+            self.presigned_sells[token_id] = self.client.create_market_order(order_args)
+            logger.debug(f"Pre-signed STOP LOSS for {token_id[:10]}...")
+        except Exception as e:
+            logger.debug(f"Failed to pre-sign stop loss: {e}")
+    
+    def execute_presigned_buy(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        market_info: Dict,
+        order_type: str = "FOK"
+    ) -> Optional[Dict]:
+        """
+        Execute a pre-signed buy order if available, otherwise create new.
+        
+        Returns:
+            Order response or None
+        """
+        price_rounded = round(price, 2)
+        key = (token_id, price_rounded)
+        
+        # Try pre-signed order first (FAST PATH)
+        if key in self.presigned_buys:
+            try:
+                py_order_type = OrderType.FOK if order_type == "FOK" else OrderType.GTC
+                result = self.client.post_order(self.presigned_buys[key], orderType=py_order_type)
+                
+                if result:
+                    logger.info(f"ORDER FILLED (pre-signed): BUY {side.upper()} {size} @ ${price_rounded}")
+                    
+                    # Track position
+                    with self._position_lock:
+                        self.active_positions[token_id] = {
+                            'side': side,
+                            'shares': size,
+                            'entry_price': price_rounded,
+                            'entry_time': time.time(),
+                            'market': market_info
+                        }
+                    
+                    # Remove used pre-signed order
+                    del self.presigned_buys[key]
+                    
+                    # IMMEDIATELY pre-sign stop loss for this position
+                    self.presign_stop_loss(token_id, size)
+                    
+                    return result
+                    
+            except Exception as e:
+                logger.debug(f"Pre-signed buy failed, falling back: {e}")
+                # Remove failed pre-signed order
+                del self.presigned_buys[key]
+        
+        # SLOW PATH: Create and post new order
+        return self.place_buy_order(token_id, side, price, size, market_info, order_type)
+    
+    def execute_presigned_stop_loss(self, token_id: str) -> Optional[Dict]:
+        """
+        Execute a pre-signed stop loss if available.
+        
+        Returns:
+            Order response or None
+        """
+        # Try pre-signed order first (FAST PATH)
+        if token_id in self.presigned_sells:
+            try:
+                result = self.client.post_order(self.presigned_sells[token_id], OrderType.GTC)
+                
+                if result:
+                    position = self.active_positions.get(token_id, {})
+                    shares = position.get('shares', 0)
+                    logger.info(f"STOP LOSS EXECUTED (pre-signed): {shares} shares")
+                    
+                    # Remove from tracked positions
+                    with self._position_lock:
+                        if token_id in self.active_positions:
+                            del self.active_positions[token_id]
+                    
+                    # Remove used pre-signed order
+                    del self.presigned_sells[token_id]
+                    
+                    return result
+                    
+            except Exception as e:
+                logger.debug(f"Pre-signed stop loss failed, falling back: {e}")
+                del self.presigned_sells[token_id]
+        
+        # SLOW PATH: Get position info and create new order
+        position = self.get_position(token_id)
+        if position:
+            return self.place_market_sell_order(token_id, position.get('shares', 0))
+        
+        return None
     
     def place_buy_order(
         self,
@@ -359,98 +544,4 @@ class FastTrader:
         return None
 
 
-class PreSignedOrderCache:
-    """
-    Cache for pre-signed orders to minimize latency at execution time
-    
-    Pre-signs orders for common price points so execution only
-    requires posting, not signing
-    """
-    
-    def __init__(self, trader: FastTrader, token_id: str, size: float):
-        self.trader = trader
-        self.token_id = token_id
-        self.size = size
-        
-        # Cache of pre-signed orders: price -> signed_order
-        self.buy_orders: Dict[float, object] = {}
-        self.sell_orders: Dict[float, object] = {}
-        
-        # Price points to pre-sign
-        self.buy_prices = [0.95, 0.96, 0.97, 0.98, 0.99]
-        self.sell_prices = [0.80, 0.85, 0.90]
-    
-    def warm_up(self):
-        """Pre-sign orders for all configured price points"""
-        if not self.trader.client:
-            return
-        
-        tick_size = self.trader._get_tick_size(self.token_id)
-        
-        # Pre-sign buy orders
-        for price in self.buy_prices:
-            shares = self.trader.calculate_shares_fast(self.size, price)
-            if shares > 0:
-                try:
-                    order_args = OrderArgs(
-                        token_id=self.token_id,
-                        price=price,
-                        size=shares,
-                        side=BUY,
-                        fee_rate_bps=0
-                    )
-                    self.buy_orders[price] = self.trader.client.create_order(order_args)
-                except Exception as e:
-                    logger.debug(f"Failed to pre-sign buy @ {price}: {e}")
-        
-        # Pre-sign sell orders
-        position = self.trader.get_position(self.token_id)
-        if position:
-            for price in self.sell_prices:
-                try:
-                    order_args = OrderArgs(
-                        token_id=self.token_id,
-                        price=price,
-                        size=position['shares'],
-                        side=SELL,
-                        fee_rate_bps=0
-                    )
-                    self.sell_orders[price] = self.trader.client.create_order(order_args)
-                except Exception as e:
-                    logger.debug(f"Failed to pre-sign sell @ {price}: {e}")
-    
-    def execute_buy(self, price: float) -> Optional[Dict]:
-        """Execute a pre-signed buy order if available"""
-        if price in self.buy_orders:
-            try:
-                return self.trader.client.post_order(
-                    self.buy_orders[price],
-                    orderType=OrderType.FOK
-                )
-            except:
-                pass
-        
-        # Fallback to regular order
-        return self.trader.place_buy_order(
-            self.token_id, 'cached', price, self.size, {}
-        )
-    
-    def execute_sell(self, price: float) -> Optional[Dict]:
-        """Execute a pre-signed sell order if available"""
-        if price in self.sell_orders:
-            try:
-                return self.trader.client.post_order(
-                    self.sell_orders[price],
-                    orderType=OrderType.FOK
-                )
-            except:
-                pass
-        
-        # Fallback to regular order
-        position = self.trader.get_position(self.token_id)
-        if position:
-            return self.trader.place_sell_order(
-                self.token_id, price, position['shares']
-            )
-        return None
 
