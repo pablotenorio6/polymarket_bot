@@ -46,6 +46,7 @@ from monitor import FastMarketMonitor
 from trader import FastTrader
 from risk_manager import FastRiskManager
 from redeem import RedeemManager
+from ws_monitor import HybridPriceMonitor
 
 
 class FastTradingBot:
@@ -73,6 +74,10 @@ class FastTradingBot:
         self.risk_manager = FastRiskManager(self.trader)  # Inject trader
         self.redeem_manager = RedeemManager()
         
+        # WebSocket price monitor (real-time, low latency)
+        self.ws_monitor = HybridPriceMonitor(self.monitor)
+        self.use_websocket = True  # Can disable for fallback to HTTP polling
+        
         # State tracking
         self.running = False
         self.last_market_id: Optional[str] = None
@@ -95,6 +100,15 @@ class FastTradingBot:
     async def run(self):
         """Main async trading loop with FAST PATH optimization"""
         self.running = True
+        
+        # Start WebSocket connection for real-time prices
+        if self.use_websocket:
+            if await self.ws_monitor.start():
+                logger.info("WebSocket connected - real-time prices enabled")
+            else:
+                logger.warning("WebSocket failed, falling back to HTTP polling")
+                self.use_websocket = False
+        
         logger.info("Starting trading loop...")
         
         while self.running:
@@ -103,6 +117,8 @@ class FastTradingBot:
             try:
                 # Check if we need to find/refresh market (SLOW PATH)
                 if self._needs_market_refresh():
+                    # For API limits
+                    await asyncio.sleep(POLL_INTERVAL)
                     await self._refresh_market()
                 
                 # FAST PATH: Only fetch prices for locked tokens
@@ -117,13 +133,8 @@ class FastTradingBot:
             self.loop_count += 1
             self.total_latency += latency
             
-            if self.loop_count % 500 == 0:
-                avg_latency = self.total_latency / self.loop_count
-                logger.info(f"Loop stats: {self.loop_count} iterations, avg {avg_latency*1000:.1f}ms")
+            # Removed continuous loop stats - only execution latency when orders trigger
             
-            # Wait for next iteration
-            sleep_time = max(0, POLL_INTERVAL - latency)
-            await asyncio.sleep(sleep_time)
         
         await self.shutdown()
     
@@ -199,6 +210,14 @@ class FastTradingBot:
                 market_id=market_id
             )
             logger.debug("Pre-signed orders ready")
+            
+            # Subscribe to WebSocket for real-time price updates
+            if self.use_websocket:
+                await self.ws_monitor.subscribe_to_market(
+                    self.locked_up_token,
+                    self.locked_down_token
+                )
+                logger.info("WebSocket subscribed to market tokens")
         
         # Periodic redeem (only on slow path)
         await self._periodic_redeem()
@@ -206,24 +225,35 @@ class FastTradingBot:
     async def _fast_iteration(self):
         """
         FAST PATH: Minimal latency price check and execution.
-        Only fetches prices for the 2 locked tokens.
+        Uses WebSocket for instant prices (no HTTP call).
         """
-        # Fetch ONLY the 2 tokens we care about (single API call)
-        prices = await self.monitor.get_prices_batch([
-            self.locked_up_token,
-            self.locked_down_token
-        ])
-        
+        # === START PROFILING - Total cycle time ===
+        t0 = time.perf_counter()
+
+        # Get prices - WebSocket (instant) or HTTP (fallback)
+        if self.use_websocket:
+            # INSTANT: Read from memory (no network call!)
+            prices = self.ws_monitor.get_prices()
+            if not prices:
+                # WebSocket not ready yet, use HTTP fallback
+                prices = await self.ws_monitor.get_prices_with_fallback()
+        else:
+            # HTTP polling fallback
+            prices = await self.monitor.get_prices_batch([
+                self.locked_up_token,
+                self.locked_down_token
+            ])
+
         if not prices:
             return
-        
+
         up_price = prices.get(self.locked_up_token)
         down_price = prices.get(self.locked_down_token)
-        
+
         # Skip if no valid prices
         if up_price is None or down_price is None:
             return
-        
+
         # Build price data for compatibility
         price_data = {
             'up_price': up_price,
@@ -232,16 +262,18 @@ class FastTradingBot:
             'down_token_id': self.locked_down_token,
             'market': self.locked_market
         }
-        
+
         # Check for trading opportunity
         await self._check_opportunity_fast(price_data)
-        
+
         # Check stop losses
         current_prices = {
             self.locked_up_token: up_price,
             self.locked_down_token: down_price
         }
         self.risk_manager.check_stop_losses(current_prices)
+
+        # No continuous profiling - only when triggers execute
     
     async def _check_opportunity_fast(self, price_data: Dict):
         """
@@ -270,14 +302,17 @@ class FastTradingBot:
         
         if trade_side:
             # TRIGGER HIT - Execute immediately using PRE-SIGNED order
+            # START PROFILING: Measure execution latency from trigger detection
+            trigger_start_time = time.perf_counter()
+
             token_id = up_token if trade_side == 'up' else down_token
             current_price = up_price if trade_side == 'up' else down_price
-            
+
             logger.info(f"TRIGGER: {trade_side.upper()} @ ${current_price:.4f} (attempt {attempts + 1}/{MAX_ATTEMPTS_PER_MARKET})")
-            
+
             # Increment attempt counter BEFORE placing order
             self.market_attempts[market_id] = attempts + 1
-            
+
             # Execute trade using PRE-SIGNED order (FAST PATH)
             order = self.trader.execute_presigned_buy(
                 token_id=token_id,
@@ -287,6 +322,15 @@ class FastTradingBot:
                 market_info=market,
                 order_type="FOK"
             )
+
+            # END PROFILING: Log execution latency
+            trigger_end_time = time.perf_counter()
+            execution_latency = (trigger_end_time - trigger_start_time) * 1000
+
+            if order:
+                logger.info(f"EXECUTION LATENCY: {execution_latency:.2f}ms | {trade_side.upper()} @ ${current_price:.4f} ✅")
+            else:
+                logger.warning(f"EXECUTION LATENCY: {execution_latency:.2f}ms | {trade_side.upper()} @ ${current_price:.4f} ❌ FAILED")
             
             if order:
                 if ENABLE_STOP_LOSS:
@@ -311,6 +355,10 @@ class FastTradingBot:
     async def shutdown(self):
         """Clean up resources"""
         logger.info("Shutting down...")
+        
+        # Close WebSocket connection
+        if self.use_websocket:
+            await self.ws_monitor.close()
         
         await self.monitor.close()
         
