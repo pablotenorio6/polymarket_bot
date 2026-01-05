@@ -207,68 +207,6 @@ class WebSocketPriceMonitor:
                     # Just update timestamp for unchanged prices
                     self.last_update = datetime.now()
 
-        # Handle legacy price_changes for compatibility (but don't use them for pricing)
-        elif 'price_changes' in event:
-            # Only log these for debugging, don't update prices
-            for change in event['price_changes']:
-                asset_id = change.get('asset_id')
-                price_str = change.get('price')
-                side = change.get('side', 'UNKNOWN')
-
-                if asset_id and price_str:
-                    # Only log, don't update actual prices
-                    logger.debug(f"ORDER BOOK: {asset_id[:10]}... = ${price_str} ({side}) - IGNORED")
-
-        # Handle legacy formats for compatibility
-        elif 'asset_id' in event or 'token_id' in event:
-            asset_id = event.get('asset_id') or event.get('token_id')
-            price = None
-
-            # Try various price fields
-            if 'price' in event:
-                price = float(event['price'])
-            elif 'midpoint' in event:
-                price = float(event['midpoint'])
-
-            if asset_id and price is not None:
-                old_price = self.prices.get(asset_id)
-                self.prices[asset_id] = price
-                self.last_update = datetime.now()
-
-                if old_price != price and self.on_price_update:
-                    self.on_price_update(asset_id, price)
-
-
-        # Handle book updates (array format)
-        elif isinstance(event, list) and len(event) > 0 and 'asset_id' in event[0]:
-            # This is a book update with bids/asks
-            book_data = event[0]
-            asset_id = book_data.get('asset_id')
-
-            if asset_id:
-                # Calculate midpoint from best bid/ask
-                bids = book_data.get('bids', [])
-                asks = book_data.get('asks', [])
-
-                if bids and asks:
-                    try:
-                        best_bid = float(bids[0]['price']) if bids else 0
-                        best_ask = float(asks[0]['price']) if asks else 1
-                        price = (best_bid + best_ask) / 2
-
-                        old_price = self.prices.get(asset_id)
-                        self.prices[asset_id] = price
-                        self.last_update = datetime.now()
-
-                        if old_price != price and self.on_price_update:
-                            self.on_price_update(asset_id, price)
-
-                        # Only log significant changes
-                        if old_price is None or abs(price - old_price) > 0.01:
-                            logger.debug(f"Book Price: {asset_id[:10]}... = ${price:.4f}")
-
-                    except (ValueError, KeyError):
-                        pass
     
     async def _reconnect(self):
         """Attempt to reconnect with exponential backoff"""
@@ -353,8 +291,8 @@ class HybridPriceMonitor:
         await self.ws_monitor.subscribe([up_token, down_token])
         logger.debug(f"Subscribed to tokens: UP={up_token[:8]}..., DOWN={down_token[:8]}...")
 
-        # Wait for real TRADE prices (not order book prices)
-        max_wait = 30  # seconds (trades might be less frequent)
+        # Quick wait for WebSocket prices (max 3 seconds)
+        max_wait = 3.0
         waited = 0
         while waited < max_wait:
             if self.ws_monitor.get_price(up_token) is not None and self.ws_monitor.get_price(down_token) is not None:
@@ -362,10 +300,23 @@ class HybridPriceMonitor:
                 down_price = self.ws_monitor.get_price(down_token)
                 logger.info(f"WS Ready: UP=${up_price:.4f}, DOWN=${down_price:.4f}")
                 return
-            await asyncio.sleep(1.0)  # Check every second
-            waited += 1.0
+            await asyncio.sleep(0.5)
+            waited += 0.5
 
-        logger.warning(f"No trade prices after {max_wait}s")
+        # No WS prices yet - fetch initial prices via HTTP and seed the cache
+        logger.info("No WS trade prices yet, fetching via HTTP...")
+        http_prices = await self.http_monitor.get_prices_batch([up_token, down_token])
+        if http_prices:
+            up_price = http_prices.get(up_token)
+            down_price = http_prices.get(down_token)
+            if up_price is not None and down_price is not None:
+                # Seed the WS cache with HTTP prices so fast loop can run
+                self.ws_monitor.prices[up_token] = up_price
+                self.ws_monitor.prices[down_token] = down_price
+                self.ws_monitor.last_update = datetime.now()
+                logger.info(f"HTTP Seed: UP=${up_price:.4f}, DOWN=${down_price:.4f}")
+            else:
+                logger.warning("HTTP fallback returned incomplete prices")
     
     def get_prices(self) -> Optional[Dict[str, float]]:
         """

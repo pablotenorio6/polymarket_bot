@@ -134,8 +134,14 @@ class FastTradingBot:
             self.total_latency += latency
             
             # Removed continuous loop stats - only execution latency when orders trigger
-            
-        
+            if self.loop_count % 5000 == 0:
+                # Small sleep to prevent CPU hogging
+                await asyncio.sleep(0)  # 0.01ms sleep
+
+            # if self.loop_count % 10000000 == 0:
+            #     avg_latency = self.total_latency / self.loop_count
+            #     logger.info(f"Loop stats: {self.loop_count} iterations, avg {avg_latency*1000:.1f}ms")
+
         await self.shutdown()
     
     def _needs_market_refresh(self) -> bool:
@@ -308,7 +314,7 @@ class FastTradingBot:
             token_id = up_token if trade_side == 'up' else down_token
             current_price = up_price if trade_side == 'up' else down_price
 
-            logger.info(f"TRIGGER: {trade_side.upper()} @ ${current_price:.4f} (attempt {attempts + 1}/{MAX_ATTEMPTS_PER_MARKET})")
+            # logger.info(f"TRIGGER: {trade_side.upper()} @ ${current_price:.4f} (attempt {attempts + 1}/{MAX_ATTEMPTS_PER_MARKET})")
 
             # Increment attempt counter BEFORE placing order
             self.market_attempts[market_id] = attempts + 1

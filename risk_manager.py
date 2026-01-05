@@ -9,6 +9,7 @@ Key differences from original RiskManager:
 """
 
 import logging
+import time
 from typing import Dict, Optional, TYPE_CHECKING
 
 from config import STOP_LOSS_PRICE, ENABLE_STOP_LOSS, MAX_CONCURRENT_POSITIONS
@@ -94,7 +95,16 @@ class FastRiskManager:
             stop_price = self.stop_losses[token_id]
             
             if current_price <= stop_price:
+                # START PROFILING: Measure execution latency from stop loss trigger
+                trigger_start_time = time.perf_counter()
+
                 self._execute_stop_loss(token_id, position, current_price)
+
+                # END PROFILING: Log execution latency
+                trigger_end_time = time.perf_counter()
+                execution_latency = (trigger_end_time - trigger_start_time) * 1000
+
+                logger.info(f"STOP LOSS EXECUTION LATENCY: {execution_latency:.2f}ms")
     
     def _handle_no_price(self, token_id: str, position: Dict):
         """Handle case when no price data is available"""
@@ -114,7 +124,7 @@ class FastRiskManager:
             entry_price = position['entry_price']
             side = position['side']
             
-            logger.warning(f"STOP LOSS TRIGGERED for {side.upper()} @ ${current_price:.3f}")
+            # logger.warning(f"STOP LOSS TRIGGERED for {side.upper()} @ ${current_price:.3f}")
             
             # Try PRE-SIGNED order first (FAST PATH)
             order = self.trader.execute_presigned_stop_loss(token_id)
