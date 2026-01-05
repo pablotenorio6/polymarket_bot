@@ -208,17 +208,11 @@ class FastTradingBot:
         FAST PATH: Minimal latency price check and execution.
         Only fetches prices for the 2 locked tokens.
         """
-        # === PROFILING ===
-        t0 = time.perf_counter()
-        
         # Fetch ONLY the 2 tokens we care about (single API call)
         prices = await self.monitor.get_prices_batch([
             self.locked_up_token,
             self.locked_down_token
         ])
-        
-        t1 = time.perf_counter()
-        api_time = (t1 - t0) * 1000
         
         if not prices:
             return
@@ -239,12 +233,8 @@ class FastTradingBot:
             'market': self.locked_market
         }
         
-        t2 = time.perf_counter()
-        
         # Check for trading opportunity
         await self._check_opportunity_fast(price_data)
-        
-        t3 = time.perf_counter()
         
         # Check stop losses
         current_prices = {
@@ -252,20 +242,6 @@ class FastTradingBot:
             self.locked_down_token: down_price
         }
         self.risk_manager.check_stop_losses(current_prices)
-        
-        t4 = time.perf_counter()
-        
-        # === LOG PROFILING (every 100 loops) ===
-        self._profile_count = getattr(self, '_profile_count', 0) + 1
-        self._profile_api = getattr(self, '_profile_api', 0) + api_time
-        self._profile_check = getattr(self, '_profile_check', 0) + (t3 - t2) * 1000
-        self._profile_stop = getattr(self, '_profile_stop', 0) + (t4 - t3) * 1000
-        
-        if self._profile_count % 100 == 0:
-            avg_api = self._profile_api / self._profile_count
-            avg_check = self._profile_check / self._profile_count
-            avg_stop = self._profile_stop / self._profile_count
-            logger.info(f"PROFILE: API={avg_api:.1f}ms | Check={avg_check:.2f}ms | Stop={avg_stop:.2f}ms")
     
     async def _check_opportunity_fast(self, price_data: Dict):
         """
