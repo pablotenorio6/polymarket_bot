@@ -328,9 +328,9 @@ class FastTradingBot:
             execution_latency = (trigger_end_time - trigger_start_time) * 1000
 
             if order:
-                logger.info(f"EXECUTION LATENCY: {execution_latency:.2f}ms | {trade_side.upper()} @ ${current_price:.4f} ✅")
+                logger.info(f"EXECUTION LATENCY: {execution_latency:.2f}ms | {trade_side.upper()} @ ${current_price:.4f}")
             else:
-                logger.warning(f"EXECUTION LATENCY: {execution_latency:.2f}ms | {trade_side.upper()} @ ${current_price:.4f} ❌ FAILED")
+                logger.warning(f"EXECUTION LATENCY: {execution_latency:.2f}ms | {trade_side.upper()} @ ${current_price:.4f} FAILED")
             
             if order:
                 if ENABLE_STOP_LOSS:
