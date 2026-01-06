@@ -107,14 +107,18 @@ class WebSocketPriceMonitor:
             return
         
         try:
-            message = {"assets_ids": token_ids, "operation": "unsubscribe"}
+            # Make a copy to avoid modifying list while iterating
+            tokens_to_remove = list(token_ids)
+            
+            message = {"assets_ids": tokens_to_remove, "operation": "unsubscribe"}
             await self.ws.send(json_dumps(message))
             
             # Clear local state
-            for tid in token_ids:
-                if tid in self.subscribed_tokens:
-                    self.subscribed_tokens.remove(tid)
+            for tid in tokens_to_remove:
                 self.prices.pop(tid, None)
+                self.subscribed_tokens.remove(tid)
+
+            
         except Exception as e:
             logger.debug(f"Unsubscribe error: {e}")
     
@@ -172,6 +176,7 @@ class WebSocketPriceMonitor:
         """
         Process a single event from WebSocket.
         SYNC function - optimized for minimal overhead.
+        Only processes events for subscribed tokens.
         """
         # Fast check: only process last_trade_price events
         if event.get(EVENT_TYPE_KEY) != LAST_TRADE_PRICE:
@@ -183,20 +188,22 @@ class WebSocketPriceMonitor:
         if not asset_id or not price_str:
             return
         
+        # IMPORTANT: Only process tokens we're subscribed to
+        if asset_id not in self.subscribed_tokens:
+            return
+        
         try:
             price = float(price_str)
         except (ValueError, TypeError):
             return
         
-        # Update price only if changed
-        old_price = self.prices.get(asset_id)
-        if old_price != price:
-            self.prices[asset_id] = price
-            self.last_update = datetime.now()
-            
-            # Callback if registered
-            if self.on_price_update:
-                self.on_price_update(asset_id, price)
+        # Update price
+        self.prices[asset_id] = price
+        self.last_update = datetime.now()
+        
+        # Callback if registered
+        if self.on_price_update:
+            self.on_price_update(asset_id, price)
     
     async def _reconnect(self):
         """Attempt to reconnect with exponential backoff"""
@@ -262,40 +269,60 @@ class HybridPriceMonitor:
             return True
         return False
     
+    async def _reconnect_ws(self):
+        """Reconnect WebSocket with fresh state"""
+        # Close existing connection
+        await self.ws_monitor.close()
+        
+        # Clear all state
+        self.ws_monitor.prices.clear()
+        self.ws_monitor.subscribed_tokens = []
+        
+        # Reconnect
+        if await self.ws_monitor.connect():
+            asyncio.create_task(self.ws_monitor.listen())
+            return True
+        return False
+    
     async def subscribe_to_market(self, up_token: str, down_token: str):
         """Subscribe to price updates for a market"""
         self.current_up_token = up_token
         self.current_down_token = down_token
 
-        # Unsubscribe from old tokens
-        if self.ws_monitor.subscribed_tokens:
-            await self.ws_monitor.unsubscribe(self.ws_monitor.subscribed_tokens)
+        # RECONNECT WebSocket for clean subscription state
+        await self._reconnect_ws()
 
         # Subscribe to new tokens
         await self.ws_monitor.subscribe([up_token, down_token])
-
-        # Quick wait for WebSocket prices (max 3 seconds)
-        for _ in range(6):  # 6 x 0.5s = 3s max
+        
+        # Quick wait for WebSocket prices (max 15 seconds)
+        for _ in range(60):  # 30 x 0.5s = 15s max
             up_price = self.ws_monitor.get_price(up_token)
             down_price = self.ws_monitor.get_price(down_token)
             if up_price is not None and down_price is not None:
                 logger.info(f"WS Ready: UP=${up_price:.4f}, DOWN=${down_price:.4f}")
+                # logger.info(f"Cache keys: {list(self.ws_monitor.prices.keys())}")
                 return
             await asyncio.sleep(0.5)
 
         # No WS prices - seed from HTTP
         logger.info("No WS trade prices yet, fetching via HTTP...")
         http_prices = await self.http_monitor.get_prices_batch([up_token, down_token])
+        
         if http_prices:
             up_price = http_prices.get(up_token)
             down_price = http_prices.get(down_token)
+            
             if up_price is not None and down_price is not None:
                 self.ws_monitor.prices[up_token] = up_price
                 self.ws_monitor.prices[down_token] = down_price
                 self.ws_monitor.last_update = datetime.now()
                 logger.info(f"HTTP Seed: UP=${up_price:.4f}, DOWN=${down_price:.4f}")
+                logger.info(f"Cache keys: {list(self.ws_monitor.prices.keys())}")
             else:
-                logger.warning("HTTP fallback returned incomplete prices")
+                logger.warning(f"HTTP failed to return prices for tokens")
+        
+        logger.info("WebSocket subscribed to market tokens")
     
     def get_prices(self) -> Optional[Dict[str, float]]:
         """Get current prices (instant from memory)"""

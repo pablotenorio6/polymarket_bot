@@ -138,9 +138,9 @@ class FastTradingBot:
             #     # Small sleep to prevent CPU hogging
             await asyncio.sleep(0.0001)  # 0.1ms sleep
 
-            if self.loop_count % 10000 == 0:
-                avg_latency = self.total_latency / self.loop_count
-                logger.info(f"Loop stats: {self.loop_count} iterations, avg {avg_latency*1000:.1f}ms")
+            # if self.loop_count % 10000 == 0:
+            #     avg_latency = self.total_latency / self.loop_count
+            #     logger.info(f"Loop stats: {self.loop_count} iterations, avg {avg_latency*1000:.1f}ms")
 
         await self.shutdown()
     
@@ -223,7 +223,6 @@ class FastTradingBot:
                     self.locked_up_token,
                     self.locked_down_token
                 )
-                logger.info("WebSocket subscribed to market tokens")
         
         # Periodic redeem (only on slow path)
         await self._periodic_redeem()
@@ -241,7 +240,6 @@ class FastTradingBot:
             # INSTANT: Read from memory (no network call!)
             prices = self.ws_monitor.get_prices()
             if not prices:
-                # WebSocket not ready yet, use HTTP fallback
                 prices = await self.ws_monitor.get_prices_with_fallback()
         else:
             # HTTP polling fallback

@@ -14,7 +14,7 @@ STOP_LOSS_PRICE = 0.8  # Emergency stop loss if price collapses
 MAX_ATTEMPTS_PER_MARKET = 3
 
 # Position sizing
-MAX_POSITION_SIZE = 5  # Maximum USD to risk per trade
+MAX_POSITION_SIZE = 15  # Maximum USD to risk per trade
 
 # ============================================
 # MONITORING & PERFORMANCE
