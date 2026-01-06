@@ -105,6 +105,7 @@ class FastRiskManager:
                 execution_latency = (trigger_end_time - trigger_start_time) * 1000
 
                 logger.info(f"STOP LOSS EXECUTION LATENCY: {execution_latency:.2f}ms")
+                logger.info(f"TRIGGERED STOP LOSS FOR {token_id[:10]}... at ${current_price:.3f}")
     
     def _handle_no_price(self, token_id: str, position: Dict):
         """Handle case when no price data is available"""
@@ -131,8 +132,8 @@ class FastRiskManager:
             
             if order:
                 # Estimate loss based on current price
-                est_loss = (current_price - entry_price) * shares
-                logger.warning(f"STOP LOSS EXECUTED | Est. Loss: ${est_loss:.2f}")
+                # est_loss = (current_price - entry_price) * shares
+                # logger.warning(f"STOP LOSS EXECUTED | Est. Loss: ${est_loss:.2f}")
                 self.remove_stop_loss(token_id)
             else:
                 logger.error("Stop loss order failed - will retry next cycle")
