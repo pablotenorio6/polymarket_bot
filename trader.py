@@ -335,6 +335,9 @@ class FastTrader:
         Returns:
             Order response or None
         """
+        logging.info(token_id)
+        logging.info(self.presigned_sells)
+        
         # Try pre-signed order first (FAST PATH)
         if token_id in self.presigned_sells:
             try:
@@ -372,7 +375,7 @@ class FastTrader:
                     return result
                     
             except Exception as e:
-                logger.debug(f"Pre-signed stop loss failed, falling back: {e}")
+                logger.error(f"Pre-signed stop loss failed, falling back: {e}")
                 del self.presigned_sells[token_id]
         
         # SLOW PATH: Get position info and create new order
