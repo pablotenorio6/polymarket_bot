@@ -127,6 +127,34 @@ class FastTrader:
     # LIVE ORDER MONITORING
     # =========================================
     
+    def _get_filled_shares(self, order_id: str) -> Optional[float]:
+        """
+        Query the API to get the actual number of shares filled for an order.
+        Important for maker fee markets where filled shares != requested shares.
+        
+        Args:
+            order_id: The order ID (hex hash from post_order response)
+            
+        Returns:
+            Number of shares filled, or None if query failed
+        """
+        if not self.client:
+            return None
+            
+        try:
+            # Use authenticated client method
+            order = self.client.get_order(order_id)
+            if order:
+                size_matched = order.get('size_matched', '0')
+                if size_matched:
+                    shares = float(size_matched)
+                    logger.debug(f"Order {order_id[:16]}... filled {shares} shares")
+                    return shares
+        except Exception as e:
+            logger.debug(f"Error querying filled shares: {e}")
+        
+        return None
+    
     def _monitor_live_order(self, order_id: str, order_type: str, start_time: float):
         """
         Monitor a LIVE order until it's resolved (MATCHED/CANCELED).
@@ -295,18 +323,27 @@ class FastTrader:
                     if error_msg:
                         logger.warning(f"Order errorMsg: {error_msg}")
                     
-                    logger.info(f"ORDER FILLED (pre-signed): BUY {side.upper()} {size} @ ${price_rounded}")
+                    # Get ACTUAL shares filled (may be less than requested due to maker fees)
+                    actual_shares = size  # Default to requested size
+                    if order_id and order_id != 'N/A':
+                        filled = self._get_filled_shares(order_id)
+                        if filled and filled > 0:
+                            actual_shares = filled
+                            if filled < size:
+                                logger.info(f"MAKER FEE: Requested {size} shares, received {actual_shares} shares (fee: {size - actual_shares:.4f})")
+                    
+                    # logger.info(f"ORDER FILLED (pre-signed): BUY {side.upper()} {actual_shares} @ ${price_rounded}")
 
                     # END PROFILING: Log execution latency
                     trigger_end_time = time.perf_counter()
                     execution_latency = (trigger_end_time - trigger_start_time) * 1000
                     logger.info(f"ORDER FILLED EXECUTION LATENCY: {execution_latency:.2f}ms")
 
-                    # Track position
+                    # Track position with ACTUAL shares received
                     with self._position_lock:
                         self.active_positions[token_id] = {
                             'side': side,
-                            'shares': size,
+                            'shares': actual_shares,  # Use actual shares, not requested
                             'entry_price': price_rounded,
                             'entry_time': time.time(),
                             'market': market_info
@@ -315,8 +352,8 @@ class FastTrader:
                     # Remove used pre-signed order
                     del self.presigned_buys[key]
                     
-                    # IMMEDIATELY pre-sign stop loss for this position
-                    self.presign_stop_loss(token_id, size)
+                    # IMMEDIATELY pre-sign stop loss with ACTUAL shares
+                    self.presign_stop_loss(token_id, actual_shares)
                     
                     return result
                     
@@ -378,12 +415,8 @@ class FastTrader:
                 logger.error(f"Pre-signed stop loss failed, falling back: {e}")
                 del self.presigned_sells[token_id]
         
-        # SLOW PATH: Get position info and create new order
-        position = self.get_position(token_id)
-        if position:
-            return self.place_market_sell_order(token_id, position.get('shares', 0))
-        
-        return None
+        # SLOW PATH: Sell all tokens (queries actual balance from API)
+        return self.sell_all_tokens(token_id)
     
     def place_buy_order(
         self,
@@ -449,17 +482,29 @@ class FastTrader:
                 if error_msg:
                     logger.warning(f"Order errorMsg: {error_msg}")
                 
-                logger.info(f"ORDER FILLED: BUY {side.upper()} {size} @ ${price_rounded}")
+                # Get ACTUAL shares filled (may be less than requested due to maker fees)
+                actual_shares = size  # Default to requested size
+                if order_id and order_id != 'N/A':
+                    filled = self._get_filled_shares(order_id)
+                    if filled and filled > 0:
+                        actual_shares = filled
+                        if filled < size:
+                            logger.info(f"MAKER FEE: Requested {size} shares, received {actual_shares} shares (fee: {size - actual_shares:.4f})")
                 
-                # Track position
+                logger.info(f"ORDER FILLED: BUY {side.upper()} {actual_shares} @ ${price_rounded}")
+                
+                # Track position with ACTUAL shares received
                 with self._position_lock:
                     self.active_positions[token_id] = {
                         'side': side,
-                        'shares': size,
+                        'shares': actual_shares,  # Use actual shares, not requested
                         'entry_price': price_rounded,
                         'entry_time': time.time(),
                         'market': market_info
                     }
+                
+                # Pre-sign stop loss with ACTUAL shares
+                self.presign_stop_loss(token_id, actual_shares)
                 
                 return result
                 
@@ -575,22 +620,23 @@ class FastTrader:
         
         try:
             # MarketOrderArgs: amount is in USD for buys, shares for sells
-            order_args = MarketOrderArgs(
+            order_args = OrderArgs(
                 token_id=token_id,
-                amount=size_rounded,
+                price=0.01,  # Minimum price = instant fill at best bid
+                size=round(size, 2),
                 side=SELL,
                 fee_rate_bps=0
             )
             
             # Step 1: Create and sign the market order
-            signed_order = self.client.create_market_order(order_args)
+            signed_order = self.client.create_order(order_args)
             
             if not signed_order:
                 logger.error("Failed to create market order")
                 return None
             
             # Step 2: Post the signed order to the exchange
-            result = self.client.post_order(signed_order, OrderType.GTC)
+            result = self.client.post_order(signed_order, OrderType.FOK)
             
             # Log API response fields
             if result:
@@ -621,6 +667,66 @@ class FastTrader:
                 logger.error(f"Market sell order failed: {e}")
         
         return None
+    
+    def get_token_balance(self, token_id: str) -> Optional[float]:
+        """
+        Get the actual token balance from Polymarket API.
+        More reliable than in-memory tracking as it reflects real blockchain state.
+        
+        Args:
+            token_id: The token/asset ID to check balance for
+            
+        Returns:
+            Number of shares held, or None if query failed
+        """
+        try:
+            wallet = self.funder_address or self.signer_address
+            if not wallet:
+                return None
+            
+            url = f"https://data-api.polymarket.com/positions?user={wallet}&sizeThreshold=0.001"
+            response = httpx.get(url, timeout=5.0)
+            
+            if response.status_code == 200:
+                positions = response.json()
+                for pos in positions:
+                    if pos.get('asset') == token_id:
+                        size = float(pos.get('size', 0))
+                        logger.debug(f"Token {token_id[:16]}... balance: {size} shares")
+                        return size
+                # Token not found = 0 balance
+                return 0.0
+        except Exception as e:
+            logger.debug(f"Error getting token balance: {e}")
+        
+        return None
+    
+    def sell_all_tokens(self, token_id: str) -> Optional[Dict]:
+        """
+        Sell ALL tokens for a specific asset without specifying amount.
+        Queries actual balance from API and sells everything.
+        
+        Args:
+            token_id: The token/asset ID to sell
+            
+        Returns:
+            Order response or None
+        """
+        # Get actual balance from API
+        balance = self.get_token_balance(token_id)
+        
+        if balance is None:
+            logger.error(f"Could not get balance for {token_id[:16]}...")
+            return None
+        
+        if balance <= 0:
+            logger.warning(f"No tokens to sell for {token_id[:16]}...")
+            return None
+        
+        logger.info(f"SELL ALL: {balance} shares of {token_id[:16]}...")
+        
+        # Use market sell with the actual balance
+        return self.place_market_sell_order(token_id, balance)
     
     def get_position(self, token_id: str) -> Optional[Dict]:
         """Get position for a token from local cache"""
