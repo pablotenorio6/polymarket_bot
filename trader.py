@@ -253,10 +253,10 @@ class FastTrader:
                 side=SELL,
                 fee_rate_bps=0
             )
-            self.presigned_sells[token_id] = self.client.create_market_order(order_args)
-            # logger.debug(f"Pre-signed STOP LOSS @ $0.01 (instant fill) for {token_id[:10]}...")
+            self.presigned_sells[token_id] = self.client.create_order(order_args)
+            logger.info(f"Pre-signed STOP LOSS @ $0.01 for {token_id[:10]}...")
         except Exception as e:
-            logger.debug(f"Failed to pre-sign stop loss: {e}")
+            logger.error(f"Failed to pre-sign stop loss: {e}")
     
     def execute_presigned_buy(
         self,
