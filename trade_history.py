@@ -27,6 +27,8 @@ from auth import get_auth
 
 def get_all_trades() -> List[Dict]:
     """Get all trades from Polymarket wallet"""
+    from py_clob_client.clob_types import TradeParams
+    
     auth = get_auth()
     client = auth.get_client()
     
@@ -35,7 +37,11 @@ def get_all_trades() -> List[Dict]:
         return []
     
     try:
-        trades = client.get_trades()
+        # When using funder mode, trades are associated with funder address
+        # We need to pass maker_address explicitly
+        maker = auth.funder_address if auth.funder_address else client.get_address()
+        params = TradeParams(maker_address=maker)
+        trades = client.get_trades(params)
         return trades if trades else []
     except Exception as e:
         logger.error(f"Error getting trades: {e}")

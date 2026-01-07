@@ -284,6 +284,21 @@ class FastTradingBot:
         FAST PATH: Check for trading opportunity with minimal overhead.
         Market is already locked, no discovery needed.
         """
+        # Block buys in the last minute before market ends
+        if self.market_end_time:
+            et_tz = pytz.timezone('America/New_York')
+            now_et = datetime.now(et_tz)
+            
+            if self.market_end_time.tzinfo is None:
+                market_end_et = et_tz.localize(self.market_end_time)
+            else:
+                market_end_et = self.market_end_time.astimezone(et_tz)
+            
+            # No buys allowed within 1 minute of market end
+            cutoff_time = market_end_et - timedelta(minutes=1)
+            if now_et >= cutoff_time:
+                return  # Too close to market end, skip buy
+        
         up_price = price_data['up_price']
         down_price = price_data['down_price']
         up_token = price_data['up_token_id']
