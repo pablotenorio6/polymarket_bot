@@ -124,6 +124,51 @@ class FastTrader:
         return tick_size
 
     # =========================================
+    # LIVE ORDER MONITORING
+    # =========================================
+    
+    def _monitor_live_order(self, order_id: str, order_type: str, start_time: float):
+        """
+        Monitor a LIVE order until it's resolved (MATCHED/CANCELED).
+        Runs in background thread to track orderbook time.
+        """
+        check_interval = 0.2  # Check every 200ms
+        max_wait = 100  # Max 60 seconds monitoring
+        
+        while True:
+            elapsed = time.time() - start_time
+            
+            if elapsed > max_wait:
+                logger.warning(f"ORDER MONITOR TIMEOUT: {order_id[:16]}... still LIVE after {elapsed:.1f}s")
+                break
+            
+            try:
+                # Query order status
+                url = f"{CLOB_API}/data/order/{order_id}"
+                response = httpx.get(url, timeout=5.0)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    status = data.get('status', 'UNKNOWN')
+                    size_matched = data.get('size_matched', '0')
+                    
+                    if status == 'MATCHED':
+                        logger.info(f"ORDER FILLED: {order_type} {order_id[:16]}... - TIME IN ORDERBOOK: {elapsed:.2f}s")
+                        break
+                    elif status == 'CANCELED':
+                        logger.warning(f"ORDER CANCELED: {order_type} {order_id[:16]}... after {elapsed:.2f}s")
+                        break
+                    elif status != 'LIVE':
+                        logger.info(f"ORDER STATUS CHANGED: {order_type} {order_id[:16]}... -> {status} after {elapsed:.2f}s")
+                        break
+                    # Still LIVE, continue monitoring
+                    
+            except Exception as e:
+                logger.debug(f"Error checking order status: {e}")
+            
+            time.sleep(check_interval)
+    
+    # =========================================
     # PRE-SIGNED ORDERS (Low Latency Trading)
     # =========================================
     
@@ -304,7 +349,13 @@ class FastTrader:
                     
                     position = self.active_positions.get(token_id, {})
                     shares = position.get('shares', 0)
-                    logger.info(f"STOP LOSS EXECUTED (pre-signed): {shares} shares")
+                    
+                    # If order is LIVE, monitor until resolved
+                    if status == 'LIVE' and order_id and order_id != 'N/A':
+                        logger.warning(f"STOP LOSS IS LIVE (in orderbook) - monitoring until filled...")
+                        _executor.submit(self._monitor_live_order, order_id, 'stop_loss', time.time())
+                    else:
+                        logger.info(f"STOP LOSS EXECUTED (pre-signed): {shares} shares")
                     
                     # Remove from tracked positions
                     with self._position_lock:
