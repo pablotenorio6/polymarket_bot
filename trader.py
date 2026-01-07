@@ -237,7 +237,16 @@ class FastTrader:
                 py_order_type = OrderType.FOK if order_type == "FOK" else OrderType.GTC
                 result = self.client.post_order(self.presigned_buys[key], orderType=py_order_type)
                 
+                # Log API response fields
                 if result:
+                    success = result.get('success', 'N/A')
+                    status = result.get('status', 'N/A')
+                    error_msg = result.get('errorMsg', '')
+                    order_id = result.get('orderID', 'N/A')
+                    logger.info(f"PRE-SIGNED BUY RESPONSE: success={success}, status={status}, orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}...")
+                    if error_msg:
+                        logger.warning(f"Order errorMsg: {error_msg}")
+                    
                     logger.info(f"ORDER FILLED (pre-signed): BUY {side.upper()} {size} @ ${price_rounded}")
 
                     # END PROFILING: Log execution latency
@@ -283,7 +292,16 @@ class FastTrader:
             try:
                 result = self.client.post_order(self.presigned_sells[token_id], OrderType.GTC)
                 
+                # Log API response fields
                 if result:
+                    success = result.get('success', 'N/A')
+                    status = result.get('status', 'N/A')
+                    error_msg = result.get('errorMsg', '')
+                    order_id = result.get('orderID', 'N/A')
+                    logger.info(f"PRE-SIGNED STOP LOSS RESPONSE: success={success}, status={status}, orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}...")
+                    if error_msg:
+                        logger.warning(f"Order errorMsg: {error_msg}")
+                    
                     position = self.active_positions.get(token_id, {})
                     shares = position.get('shares', 0)
                     logger.info(f"STOP LOSS EXECUTED (pre-signed): {shares} shares")
@@ -363,7 +381,16 @@ class FastTrader:
             py_order_type = OrderType.FOK if order_type == "FOK" else OrderType.GTC
             result = self.client.post_order(signed_order, orderType=py_order_type)
             
+            # Log API response fields
             if result:
+                success = result.get('success', 'N/A')
+                status = result.get('status', 'N/A')
+                error_msg = result.get('errorMsg', '')
+                order_id = result.get('orderID', 'N/A')
+                logger.info(f"BUY ORDER RESPONSE: success={success}, status={status}, orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}...")
+                if error_msg:
+                    logger.warning(f"Order errorMsg: {error_msg}")
+                
                 logger.info(f"ORDER FILLED: BUY {side.upper()} {size} @ ${price_rounded}")
                 
                 # Track position
@@ -426,7 +453,16 @@ class FastTrader:
             py_order_type = OrderType.FOK if order_type == "FOK" else OrderType.GTC
             result = self.client.post_order(signed_order, orderType=py_order_type)
             
+            # Log API response fields
             if result:
+                success = result.get('success', 'N/A')
+                status = result.get('status', 'N/A')
+                error_msg = result.get('errorMsg', '')
+                order_id = result.get('orderID', 'N/A')
+                logger.info(f"SELL ORDER RESPONSE: success={success}, status={status}, orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}...")
+                if error_msg:
+                    logger.warning(f"Order errorMsg: {error_msg}")
+                
                 logger.info(f"SOLD: {size_rounded} shares @ ${price_rounded}")
                 
                 # Remove from tracked positions
@@ -498,7 +534,16 @@ class FastTrader:
             # Step 2: Post the signed order to the exchange
             result = self.client.post_order(signed_order, OrderType.GTC)
             
+            # Log API response fields
             if result:
+                success = result.get('success', 'N/A')
+                status = result.get('status', 'N/A')
+                error_msg = result.get('errorMsg', '')
+                order_id = result.get('orderID', 'N/A')
+                logger.info(f"MARKET SELL RESPONSE: success={success}, status={status}, orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}...")
+                if error_msg:
+                    logger.warning(f"Order errorMsg: {error_msg}")
+                
                 logger.info(f"MARKET SELL EXECUTED: {size_rounded} shares")
                 
                 # Remove from tracked positions
