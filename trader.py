@@ -232,7 +232,8 @@ class FastTrader:
     
     def presign_stop_loss(self, token_id: str, shares: float):
         """
-        Pre-sign a market sell order for stop loss.
+        Pre-sign a sell order for stop loss at minimum price.
+        Uses price=0.01 to ensure immediate execution against any bid.
         Call this immediately after a buy order fills.
         
         Args:
@@ -243,15 +244,17 @@ class FastTrader:
             return
         
         try:
-            # Pre-sign market sell order
-            order_args = MarketOrderArgs(
+            # Pre-sign sell order at MINIMUM PRICE (0.01)
+            # This ensures immediate execution - will fill at best available bid
+            order_args = OrderArgs(
                 token_id=token_id,
-                amount=round(shares, 2),
+                price=0.01,  # Minimum price = instant fill at best bid
+                size=round(shares, 2),
                 side=SELL,
                 fee_rate_bps=0
             )
             self.presigned_sells[token_id] = self.client.create_market_order(order_args)
-            logger.debug(f"Pre-signed STOP LOSS for {token_id[:10]}...")
+            # logger.debug(f"Pre-signed STOP LOSS @ $0.01 (instant fill) for {token_id[:10]}...")
         except Exception as e:
             logger.debug(f"Failed to pre-sign stop loss: {e}")
     
@@ -335,7 +338,8 @@ class FastTrader:
         # Try pre-signed order first (FAST PATH)
         if token_id in self.presigned_sells:
             try:
-                result = self.client.post_order(self.presigned_sells[token_id], OrderType.GTC)
+                # FOK = Fill or Kill - execute immediately at best available price or fail
+                result = self.client.post_order(self.presigned_sells[token_id], OrderType.FOK)
                 
                 # Log API response fields
                 if result:
