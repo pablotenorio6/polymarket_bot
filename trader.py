@@ -282,7 +282,7 @@ class FastTrader:
                 fee_rate_bps=0
             )
             self.presigned_sells[token_id] = self.client.create_order(order_args)
-            logger.info(f"Pre-signed STOP LOSS @ $0.01 for {token_id[:10]}...")
+            # logger.info(f"Pre-signed STOP LOSS @ $0.01 for {token_id[:10]}...")
         except Exception as e:
             logger.error(f"Failed to pre-sign stop loss: {e}")
     
@@ -337,7 +337,7 @@ class FastTrader:
                     # END PROFILING: Log execution latency
                     trigger_end_time = time.perf_counter()
                     execution_latency = (trigger_end_time - trigger_start_time) * 1000
-                    logger.info(f"ORDER FILLED EXECUTION LATENCY: {execution_latency:.2f}ms")
+                    logger.info(f"BUY ORDER FILLED EXECUTION LATENCY: {execution_latency:.2f}ms")
 
                     # Track position with ACTUAL shares received
                     with self._position_lock:
@@ -372,8 +372,8 @@ class FastTrader:
         Returns:
             Order response or None
         """
-        logging.info(token_id)
-        logging.info(self.presigned_sells)
+        # logging.info(token_id)
+        # logging.info(self.presigned_sells)
         
         # Try pre-signed order first (FAST PATH)
         if token_id in self.presigned_sells:

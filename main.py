@@ -203,7 +203,7 @@ class FastTradingBot:
             question = market.get('question', 'Unknown')[:50]
             logger.info(f"NEW MARKET: {question}...")
             end_time_et = self.market_end_time.astimezone(et_tz) if self.market_end_time.tzinfo else et_tz.localize(self.market_end_time)
-            logger.info(f"  Ends: {end_time_et.strftime('%H:%M:%S')} ET")
+            # logger.info(f"  Ends: {end_time_et.strftime('%H:%M:%S')} ET")
             self.last_market_id = market_id
             self.market_attempts.clear()
             
@@ -215,7 +215,7 @@ class FastTradingBot:
                 size=MAX_POSITION_SIZE,
                 market_id=market_id
             )
-            logger.debug("Pre-signed orders ready")
+            # logger.debug("Pre-signed orders ready")
             
             # Subscribe to WebSocket for real-time price updates
             if self.use_websocket:
@@ -345,7 +345,7 @@ class FastTradingBot:
             if order:
                 if ENABLE_STOP_LOSS:
                     self.risk_manager.set_stop_loss(token_id, STOP_LOSS_PRICE)
-                    logger.info(f"STOP LOSS set @ ${STOP_LOSS_PRICE:.2f}")
+                    # logger.info(f"STOP LOSS set @ ${STOP_LOSS_PRICE:.2f}")
                 # Reset attempts on success (filled position)
                 self.market_attempts[market_id] = MAX_ATTEMPTS_PER_MARKET
     

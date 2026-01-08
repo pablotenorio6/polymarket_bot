@@ -105,7 +105,7 @@ class FastRiskManager:
                 execution_latency = (trigger_end_time - trigger_start_time) * 1000
 
                 logger.info(f"STOP LOSS EXECUTION LATENCY: {execution_latency:.2f}ms")
-                logger.info(f"TRIGGERED STOP LOSS FOR {token_id[:10]}... at ${current_price:.3f}")
+                # logger.info(f"TRIGGERED STOP LOSS FOR {token_id[:10]}... at ${current_price:.3f}")
     
     def _handle_no_price(self, token_id: str, position: Dict):
         """Handle case when no price data is available"""

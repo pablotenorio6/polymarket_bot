@@ -73,7 +73,7 @@ class WebSocketPriceMonitor:
             )
             self.connected = True
             self.reconnect_delay = 1.0
-            logger.info(f"WebSocket connected to {WS_MARKET_URL}")
+            # logger.info(f"WebSocket connected to {WS_MARKET_URL}")
             return True
         except Exception as e:
             logger.error(f"WebSocket connection failed: {e}")
@@ -94,7 +94,7 @@ class WebSocketPriceMonitor:
             }
             await self.ws.send(json_dumps(message))
             self.subscribed_tokens = token_ids
-            logger.info(f"Subscribed to {len(token_ids)} tokens: {[tid[:10] for tid in token_ids]}")
+            # logger.info(f"Subscribed to {len(token_ids)} tokens: {[tid[:10] for tid in token_ids]}")
             await asyncio.sleep(2)
             return True
         except Exception as e:
@@ -232,7 +232,7 @@ class WebSocketPriceMonitor:
                 pass
             self.ws = None
         
-        logger.info("WebSocket closed")
+        # logger.info("WebSocket closed")
     
     def get_price(self, token_id: str) -> Optional[float]:
         """Get current price for a token (instant, no API call)"""
@@ -300,7 +300,7 @@ class HybridPriceMonitor:
             up_price = self.ws_monitor.get_price(up_token)
             down_price = self.ws_monitor.get_price(down_token)
             if up_price is not None and down_price is not None:
-                logger.info(f"WS Ready: UP=${up_price:.4f}, DOWN=${down_price:.4f}")
+                # logger.info(f"WS Ready: UP=${up_price:.4f}, DOWN=${down_price:.4f}")
                 # logger.info(f"Cache keys: {list(self.ws_monitor.prices.keys())}")
                 return
             await asyncio.sleep(0.5)
@@ -317,12 +317,12 @@ class HybridPriceMonitor:
                 self.ws_monitor.prices[up_token] = up_price
                 self.ws_monitor.prices[down_token] = down_price
                 self.ws_monitor.last_update = datetime.now()
-                logger.info(f"HTTP Seed: UP=${up_price:.4f}, DOWN=${down_price:.4f}")
-                logger.info(f"Cache keys: {list(self.ws_monitor.prices.keys())}")
+                # logger.info(f"HTTP Seed: UP=${up_price:.4f}, DOWN=${down_price:.4f}")
+                # logger.info(f"Cache keys: {list(self.ws_monitor.prices.keys())}")
             else:
                 logger.warning(f"HTTP failed to return prices for tokens")
         
-        logger.info("WebSocket subscribed to market tokens")
+        # logger.info("WebSocket subscribed to market tokens")
     
     def get_prices(self) -> Optional[Dict[str, float]]:
         """Get current prices (instant from memory)"""
