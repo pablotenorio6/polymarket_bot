@@ -2,6 +2,8 @@
 Configuration for Polymarket Trading Bot
 """
 
+import os
+
 # API Endpoints
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -66,6 +68,11 @@ MAX_CONCURRENT_POSITIONS = 2  # Max number of simultaneous positions
 ENABLE_STOP_LOSS = True  # Enable automatic stop loss
 ENABLE_TAKE_PROFIT = False  # Take profit at 0.99 (False = hold until market resolution)
 
+
+# ============================================
+# DATA COLLECTION
+# ============================================
+DATA_COLLECTOR_API_URL = os.getenv("DATA_COLLECTOR_API_URL", "http://localhost:8000")
 
 # ============================================
 # LOGGING

@@ -47,6 +47,7 @@ from trader import FastTrader
 from risk_manager import FastRiskManager
 from redeem import RedeemManager
 from ws_monitor import HybridPriceMonitor
+from data_collector import DataCollector
 
 
 class FastTradingBot:
@@ -77,6 +78,9 @@ class FastTradingBot:
         # WebSocket price monitor (real-time, low latency)
         self.ws_monitor = HybridPriceMonitor(self.monitor)
         self.use_websocket = True  # Can disable for fallback to HTTP polling
+        
+        # Data collector for price history
+        self.data_collector = DataCollector()
         
         # State tracking
         self.running = False
@@ -163,12 +167,31 @@ class FastTradingBot:
             
             if now_et >= market_end_et:
                 logger.info(f"Market expired (now: {now_et.strftime('%H:%M:%S')} ET >= end: {market_end_et.strftime('%H:%M:%S')} ET)")
+                # Mark for saving - will be saved in _refresh_market
+                self._market_expired = True
                 return True
         
         return False
     
     async def _refresh_market(self):
         """SLOW PATH: Find new market and set up (runs every ~15 min)"""
+        # Save previous market data if it expired
+        if getattr(self, '_market_expired', False) and self.data_collector.has_active_market():
+            # Determine winner based on last known prices
+            winner = None
+            if self.locked_up_token and self.locked_down_token:
+                prices = self.ws_monitor.get_prices()
+                if prices:
+                    up_price = prices.get(self.locked_up_token, 0)
+                    down_price = prices.get(self.locked_down_token, 0)
+                    if up_price > 0.5:
+                        winner = 'UP'
+                    elif down_price > 0.5:
+                        winner = 'DOWN'
+            
+            await self.data_collector.save_market(winner=winner)
+            self._market_expired = False
+        
         # Clear locked state
         self.locked_market = None
         self.locked_up_token = None
@@ -223,6 +246,16 @@ class FastTradingBot:
                     self.locked_up_token,
                     self.locked_down_token
                 )
+            
+            # Start collecting price data for this market
+            self.data_collector.start_market(
+                condition_id=market.get('conditionId', ''),
+                question=market.get('question', 'Unknown'),
+                up_token_id=self.locked_up_token,
+                down_token_id=self.locked_down_token,
+                start_time=datetime.now(et_tz),
+                end_time=self.market_end_time
+            )
         
         # Periodic redeem (only on slow path)
         await self._periodic_redeem()
@@ -257,6 +290,9 @@ class FastTradingBot:
         # Skip if no valid prices
         if up_price is None or down_price is None:
             return
+
+        # Record price snapshot (every 1 second)
+        self.data_collector.record_price(up_price, down_price)
 
         # Build price data for compatibility
         price_data = {
@@ -365,6 +401,13 @@ class FastTradingBot:
     async def shutdown(self):
         """Clean up resources"""
         logger.info("Shutting down...")
+        
+        # Save any pending market data
+        if self.data_collector.has_active_market():
+            logger.info("Saving pending market data...")
+            await self.data_collector.save_market()
+        
+        await self.data_collector.close()
         
         # Close WebSocket connection
         if self.use_websocket:
