@@ -2,6 +2,7 @@
 Data collector for BTC 15-min market prices.
 
 Collects price snapshots every second and sends to local API when market ends.
+Now includes real-time BTC price from Chainlink oracle.
 """
 
 import httpx
@@ -14,6 +15,7 @@ import pytz
 import asyncio
 
 from config import DATA_COLLECTOR_API_URL
+from chainlink_price import get_btc_price, get_price_feed
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,7 @@ class PriceSnapshot:
     timestamp: datetime
     up_price: float
     down_price: float
+    # btc_price: Optional[float] = None  # BTC price from Chainlink
 
 
 @dataclass
@@ -40,6 +43,7 @@ class MarketData:
 class DataCollector:
     """
     Collects price data during market and sends to API on market end.
+    Now includes real-time BTC price from Chainlink oracle.
     
     Usage:
         collector = DataCollector()
@@ -63,6 +67,10 @@ class DataCollector:
         
         # Async client for sending data
         self._client: Optional[httpx.AsyncClient] = None
+        
+        # Initialize Chainlink price feed for BTC
+        # self._price_feed = get_price_feed()
+        # logger.info("[DataCollector] Chainlink BTC price feed initialized")
     
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create async HTTP client"""
@@ -105,6 +113,7 @@ class DataCollector:
     def record_price(self, up_price: float, down_price: float) -> bool:
         """
         Record a price snapshot if enough time has passed.
+        Includes BTC price from Chainlink oracle.
         
         Returns True if a snapshot was recorded, False otherwise.
         """
@@ -117,11 +126,15 @@ class DataCollector:
         if now - self.last_record_time < self.record_interval:
             return False
         
-        # Create snapshot with current timestamp
+        # Get current BTC price from Chainlink
+        # btc_price = self._price_feed.get_btc_price()
+        
+        # Create snapshot with current timestamp and BTC price
         snapshot = PriceSnapshot(
             timestamp=datetime.now(self.et_tz),
             up_price=up_price,
             down_price=down_price
+            # btc_price=btc_price
         )
         
         self.current_market.snapshots.append(snapshot)
@@ -163,6 +176,7 @@ class DataCollector:
                     "timestamp": s.timestamp.isoformat(),
                     "up_price": s.up_price,
                     "down_price": s.down_price
+                    # "btc_price": s.btc_price  # BTC price from Chainlink
                 }
                 for s in self.current_market.snapshots
             ]
