@@ -752,11 +752,15 @@ class FastTrader:
         """
         Determine which side to trade based on prices
         
+        Strategy: Buy when price drops to trigger level (e.g., 0.02)
+        Places limit order at entry price (e.g., 0.01)
+        
         Returns 'up', 'down', or None
         """
-        if up_price >= trigger_price:
+        # Buy the side that drops to the trigger price
+        if up_price <= trigger_price:
             return 'up'
-        elif down_price >= trigger_price:
+        elif down_price <= trigger_price:
             return 'down'
         return None
 

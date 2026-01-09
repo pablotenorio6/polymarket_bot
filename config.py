@@ -9,10 +9,10 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
 # Trading Parameters
-TRIGGER_PRICE = 0.96  # When a side reaches this price, we buy that side
-ENTRY_PRICE = 0.97    # Price we're willing to pay (fill or kill)
-ORDER_PRICE = 0.97    # Alias for ENTRY_PRICE (backwards compatibility)
-STOP_LOSS_PRICE = 0.8  # Emergency stop loss if price collapses
+TRIGGER_PRICE = 0.02  # When a side drops to this price, we place limit order
+ENTRY_PRICE = 0.01    # Limit order price (GTC - waits in orderbook)
+ORDER_PRICE = 0.01    # Alias for ENTRY_PRICE (backwards compatibility)
+STOP_LOSS_PRICE = 0.01  # Not used in current strategy
 MAX_ATTEMPTS_PER_MARKET = 3
 
 # Position sizing
@@ -65,7 +65,7 @@ CHAIN_ID = 137
 
 # Risk Management
 MAX_CONCURRENT_POSITIONS = 2  # Max number of simultaneous positions
-ENABLE_STOP_LOSS = True  # Enable automatic stop loss
+ENABLE_STOP_LOSS = False  # Disabled - hold position until market resolution
 ENABLE_TAKE_PROFIT = False  # Take profit at 0.99 (False = hold until market resolution)
 
 

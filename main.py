@@ -64,9 +64,9 @@ class FastTradingBot:
         logger.info("=" * 50)
         logger.info("POLYMARKET FAST TRADING BOT")
         logger.info("=" * 50)
-        logger.info(f"Strategy: BTC 15-min Up/Down")
-        logger.info(f"Trigger: ${TRIGGER_PRICE:.2f} | Entry: ${ENTRY_PRICE:.2f}")
-        logger.info(f"Stop Loss: ${STOP_LOSS_PRICE:.2f} | Size: ${MAX_POSITION_SIZE}")
+        logger.info(f"Strategy: BTC 15-min Up/Down - Low Price Buy")
+        logger.info(f"Trigger: ${TRIGGER_PRICE:.2f} | Limit Order: ${ENTRY_PRICE:.2f}")
+        logger.info(f"Hold until resolution | Size: ${MAX_POSITION_SIZE}")
         logger.info("=" * 50)
         
         # Core components (use persistent client for best performance)
@@ -306,13 +306,7 @@ class FastTradingBot:
         # Check for trading opportunity
         await self._check_opportunity_fast(price_data)
 
-        # Check stop losses
-        current_prices = {
-            self.locked_up_token: up_price,
-            self.locked_down_token: down_price
-        }
-        self.risk_manager.check_stop_losses(current_prices)
-
+        # Stop losses disabled - hold until market resolution
         # No continuous profiling - only when triggers execute
     
     async def _check_opportunity_fast(self, price_data: Dict):
@@ -368,21 +362,19 @@ class FastTradingBot:
             self.market_attempts[market_id] = attempts + 1
 
             # Execute trade using PRE-SIGNED order (FAST PATH)
+            # GTC = Good Till Cancelled - limit order waits in orderbook
             order = self.trader.execute_presigned_buy(
                 token_id=token_id,
                 side=trade_side,
                 price=ENTRY_PRICE,
                 size=MAX_POSITION_SIZE,
                 market_info=market,
-                order_type="FOK"
+                order_type="GTC"  # Limit order - waits in orderbook
             )
 
-           
             if order:
-                if ENABLE_STOP_LOSS:
-                    self.risk_manager.set_stop_loss(token_id, STOP_LOSS_PRICE)
-                    # logger.info(f"STOP LOSS set @ ${STOP_LOSS_PRICE:.2f}")
-                # Reset attempts on success (filled position)
+                # No stop loss - hold until market resolution
+                # Reset attempts on success (order placed)
                 self.market_attempts[market_id] = MAX_ATTEMPTS_PER_MARKET
     
     async def _periodic_redeem(self):
