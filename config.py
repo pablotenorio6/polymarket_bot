@@ -9,14 +9,14 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
 # Trading Parameters
-TRIGGER_PRICE = 0.02  # When a side drops to this price, we place limit order
+TRIGGER_PRICE = 0.03  # When a side drops to this price, we place limit order
 ENTRY_PRICE = 0.01    # Limit order price (GTC - waits in orderbook)
 ORDER_PRICE = 0.01    # Alias for ENTRY_PRICE (backwards compatibility)
 STOP_LOSS_PRICE = 0.01  # Not used in current strategy
 MAX_ATTEMPTS_PER_MARKET = 3
 
 # Position sizing
-MAX_POSITION_SIZE = 15  # Maximum USD to risk per trade
+MAX_POSITION_SIZE = 50  # Maximum USD to risk per trade
 
 # ============================================
 # MONITORING & PERFORMANCE
