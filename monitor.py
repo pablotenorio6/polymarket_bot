@@ -122,6 +122,35 @@ class FastMarketMonitor:
         
         return slugs
     
+    def _generate_future_slugs(self, hours_ahead: int = 24) -> List[str]:
+        """
+        Generate slugs for future 15-min markets (up to hours_ahead).
+        Used to detect newly created markets before they become active.
+        
+        Args:
+            hours_ahead: How many hours into the future to scan (default 24h)
+        
+        Returns:
+            List of slugs for future markets
+        """
+        now_et = datetime.now(self.et_tz)
+        current_minute = now_et.minute
+        rounded_minute = (current_minute // 15) * 15
+        current_rounded = now_et.replace(minute=rounded_minute, second=0, microsecond=0)
+        
+        # Calculate number of 15-min periods
+        periods = (hours_ahead * 60) // 15  # e.g., 24h = 96 periods
+        
+        slugs = []
+        for prefix in self.market_prefixes:
+            # Start from next period (+1) up to hours_ahead
+            for i in range(1, periods + 1):
+                time_offset = current_rounded + timedelta(minutes=15 * i)
+                timestamp = int(time_offset.timestamp())
+                slugs.append(f"{prefix}{timestamp}")
+        
+        return slugs
+    
     async def _fetch_event_by_slug(self, client: httpx.AsyncClient, slug: str) -> Optional[Dict]:
         """Fetch a single event by slug"""
         try:
@@ -212,6 +241,90 @@ class FastMarketMonitor:
             logger.debug(f"Found {len(active_markets)} active markets")
         
         return active_markets
+    
+    async def get_future_markets(self, hours_ahead: int = 24) -> List[Dict]:
+        """
+        Fetch future 15-min markets that haven't started yet.
+        Used to place early orders for maximum FIFO priority.
+        
+        Args:
+            hours_ahead: How many hours into the future to scan
+            
+        Returns:
+            List of market dicts with tokens and timing info
+        """
+        slugs = self._generate_future_slugs(hours_ahead)
+        
+        # Batch fetch in chunks to avoid rate limits
+        chunk_size = 20
+        all_markets = []
+        
+        for i in range(0, len(slugs), chunk_size):
+            chunk = slugs[i:i + chunk_size]
+            
+            async def fetch_chunk(client):
+                tasks = [self._fetch_event_by_slug(client, slug) for slug in chunk]
+                return await asyncio.gather(*tasks, return_exceptions=True)
+            
+            results = await self._make_requests(fetch_chunk)
+            
+            now_utc = datetime.now(pytz.UTC)
+            
+            for event in results:
+                if event is None or isinstance(event, Exception):
+                    continue
+                
+                # Must be active (not cancelled) but not closed
+                if not event.get('active') or event.get('closed'):
+                    continue
+                
+                # Get timing
+                start_dt = parser.parse(event.get('startTime', ''))
+                end_dt = parser.parse(event.get('endDate', ''))
+                
+                # Only include FUTURE markets (haven't started yet)
+                if start_dt > now_utc:
+                    markets = event.get('markets', [])
+                    if markets:
+                        market = markets[0]
+                        
+                        # Parse token IDs
+                        clob_tokens = market.get('clobTokenIds', [])
+                        if isinstance(clob_tokens, str):
+                            clob_tokens = json.loads(clob_tokens)
+                        
+                        outcomes = market.get('outcomes', [])
+                        if isinstance(outcomes, str):
+                            outcomes = json.loads(outcomes)
+                        
+                        if len(clob_tokens) >= 2 and len(outcomes) >= 2:
+                            up_idx = 0 if outcomes[0].lower() == 'up' else 1
+                            down_idx = 1 - up_idx
+                            
+                            all_markets.append({
+                                'market': market,
+                                'condition_id': market.get('conditionId'),
+                                'question': market.get('question', ''),
+                                'up_token_id': clob_tokens[up_idx],
+                                'down_token_id': clob_tokens[down_idx],
+                                'start_time': start_dt,
+                                'end_time': end_dt
+                            })
+                            
+                            # Cache market
+                            condition_id = market.get('conditionId')
+                            if condition_id:
+                                self.market_cache[condition_id] = market
+            
+            # Small delay between chunks to respect rate limits
+            if i + chunk_size < len(slugs):
+                await asyncio.sleep(0.1)
+        
+        # Sort by start time (earliest first)
+        all_markets.sort(key=lambda x: x['start_time'])
+        
+        logger.debug(f"Found {len(all_markets)} future markets")
+        return all_markets
     
     async def get_prices_batch(self, token_ids: List[str]) -> Dict[str, float]:
         """

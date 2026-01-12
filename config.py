@@ -8,15 +8,15 @@ import os
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
-# Trading Parameters
-TRIGGER_PRICE = 0.03  # When a side drops to this price, we place limit order
+# Trading Parameters - Early Queue Strategy
+# Place both UP and DOWN limit orders at market start for FIFO priority
 ENTRY_PRICE = 0.01    # Limit order price (GTC - waits in orderbook)
 ORDER_PRICE = 0.01    # Alias for ENTRY_PRICE (backwards compatibility)
 STOP_LOSS_PRICE = 0.01  # Not used in current strategy
 MAX_ATTEMPTS_PER_MARKET = 3
 
 # Position sizing
-MAX_POSITION_SIZE = 50  # Maximum USD to risk per trade
+MAX_POSITION_SIZE = 100  # Maximum USD to risk per trade
 
 # ============================================
 # MONITORING & PERFORMANCE

@@ -482,6 +482,15 @@ class FastTrader:
                 if error_msg:
                     logger.warning(f"Order errorMsg: {error_msg}")
                 
+                # For GTC orders, they go to orderbook and wait - don't track position yet
+                if order_type == "GTC":
+                    if status == 'LIVE':
+                        logger.info(f"GTC ORDER LIVE: BUY {side.upper()} {size} @ ${price_rounded} - waiting in orderbook")
+                    elif status == 'MATCHED':
+                        logger.info(f"GTC ORDER MATCHED: BUY {side.upper()} {size} @ ${price_rounded}")
+                    return result
+                
+                # For FOK orders, track position if filled
                 # Get ACTUAL shares filled (may be less than requested due to maker fees)
                 actual_shares = size  # Default to requested size
                 if order_id and order_id != 'N/A':
@@ -493,7 +502,7 @@ class FastTrader:
                 
                 logger.info(f"ORDER FILLED: BUY {side.upper()} {actual_shares} @ ${price_rounded}")
                 
-                # Track position with ACTUAL shares received
+                # Track position with ACTUAL shares received (FOK only)
                 with self._position_lock:
                     self.active_positions[token_id] = {
                         'side': side,
@@ -763,6 +772,60 @@ class FastTrader:
         elif down_price <= trigger_price:
             return 'down'
         return None
+    
+    def get_open_orders(self) -> List[Dict]:
+        """
+        Get all open (LIVE) orders from Polymarket.
+        Used to recover state after restart.
+        
+        Returns:
+            List of open order dicts with token_id, price, size, etc.
+        """
+        if not self.client:
+            return []
+        
+        try:
+            # Get all open orders for our wallet
+            orders = self.client.get_orders()
+            
+            # Filter for LIVE orders only
+            open_orders = []
+            if orders:
+                for order in orders:
+                    if order.get('status') == 'LIVE':
+                        open_orders.append({
+                            'order_id': order.get('id'),
+                            'token_id': order.get('asset_id'),
+                            'price': float(order.get('price', 0)),
+                            'size': float(order.get('original_size', 0)),
+                            'side': order.get('side'),
+                            'created_at': order.get('created_at')
+                        })
+            
+            logger.info(f"Found {len(open_orders)} open orders in Polymarket")
+            return open_orders
+            
+        except Exception as e:
+            logger.error(f"Error fetching open orders: {e}")
+            return []
+    
+    def get_open_order_token_ids(self) -> set:
+        """
+        Get set of token_ids that have open orders.
+        Used to determine which markets already have orders placed.
+        
+        Returns:
+            Set of token_ids with open orders
+        """
+        open_orders = self.get_open_orders()
+        token_ids = set()
+        
+        for order in open_orders:
+            token_id = order.get('token_id')
+            if token_id:
+                token_ids.add(token_id)
+        
+        return token_ids
 
 
 

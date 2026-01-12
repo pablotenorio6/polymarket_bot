@@ -13,7 +13,7 @@ import signal
 import sys
 import logging
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 from datetime import datetime, timedelta
 import pytz
 
@@ -36,9 +36,7 @@ logging.getLogger('httpcore').setLevel(logging.WARNING)
 logging.getLogger('py_clob_client').setLevel(logging.WARNING)
 
 from config import (
-    TRIGGER_PRICE, ENTRY_PRICE, MAX_POSITION_SIZE,
-    STOP_LOSS_PRICE, ENABLE_STOP_LOSS,
-    POLL_INTERVAL, MAX_ATTEMPTS_PER_MARKET
+    ENTRY_PRICE, MAX_POSITION_SIZE, POLL_INTERVAL
 )
 
 
@@ -64,10 +62,19 @@ class FastTradingBot:
         logger.info("=" * 50)
         logger.info("POLYMARKET FAST TRADING BOT")
         logger.info("=" * 50)
-        logger.info(f"Strategy: BTC 15-min Up/Down - Low Price Buy")
-        logger.info(f"Trigger: ${TRIGGER_PRICE:.2f} | Limit Order: ${ENTRY_PRICE:.2f}")
+        logger.info(f"Strategy: BTC 15-min Up/Down - MAXIMUM PRIORITY")
+        logger.info(f"Scan future markets & place orders immediately @ ${ENTRY_PRICE:.2f}")
         logger.info(f"Hold until resolution | Size: ${MAX_POSITION_SIZE}")
         logger.info("=" * 50)
+        
+        # === ORDERS TRACKING ===
+        # Set of condition_ids where we've already placed orders
+        self.orders_placed_markets: Set[str] = set()
+        
+        # Future market scanning config
+        self.future_scan_hours = 24  # Scan 24 hours ahead
+        self.last_future_scan = 0
+        self.future_scan_interval = 60  # Scan every 60 seconds
         
         # Core components (use persistent client for best performance)
         self.monitor = FastMarketMonitor(use_persistent_client=True)
@@ -113,15 +120,21 @@ class FastTradingBot:
                 logger.warning("WebSocket failed, falling back to HTTP polling")
                 self.use_websocket = False
         
+        # Recover state from open orders (survives restarts)
+        await self._recover_orders_state()
+        
         logger.info("Starting trading loop...")
         
         while self.running:
             loop_start = time.perf_counter()
             
             try:
-                # Check if we need to find/refresh market (SLOW PATH)
+                # === TASK 1: Scan for NEW future markets and place orders ===
+                await self._scan_and_place_future_orders()
+                
+                # === TASK 2: Monitor current active market for price data ===
+                # Check if we need to find/refresh current market
                 if self._needs_market_refresh():
-                    # For API limits
                     await asyncio.sleep(POLL_INTERVAL)
                     await self._refresh_market()
                 
@@ -226,19 +239,9 @@ class FastTradingBot:
             question = market.get('question', 'Unknown')[:50]
             logger.info(f"NEW MARKET: {question}...")
             end_time_et = self.market_end_time.astimezone(et_tz) if self.market_end_time.tzinfo else et_tz.localize(self.market_end_time)
-            # logger.info(f"  Ends: {end_time_et.strftime('%H:%M:%S')} ET")
+            logger.info(f"  Ends: {end_time_et.strftime('%H:%M:%S')} ET")
             self.last_market_id = market_id
             self.market_attempts.clear()
-            
-            # PRE-SIGN orders for instant execution
-            self.trader.presign_buy_orders(
-                up_token_id=self.locked_up_token,
-                down_token_id=self.locked_down_token,
-                price=ENTRY_PRICE,
-                size=MAX_POSITION_SIZE,
-                market_id=market_id
-            )
-            # logger.debug("Pre-signed orders ready")
             
             # Subscribe to WebSocket for real-time price updates
             if self.use_websocket:
@@ -256,6 +259,9 @@ class FastTradingBot:
                 start_time=datetime.now(et_tz),
                 end_time=self.market_end_time
             )
+            
+            # Orders are now placed by _scan_and_place_future_orders
+            # when the market is first detected (before it becomes active)
         
         # Periodic redeem (only on slow path)
         await self._periodic_redeem()
@@ -303,79 +309,164 @@ class FastTradingBot:
             'market': self.locked_market
         }
 
-        # Check for trading opportunity
-        await self._check_opportunity_fast(price_data)
-
-        # Stop losses disabled - hold until market resolution
-        # No continuous profiling - only when triggers execute
+        # Orders already placed at market start - just collecting data
+        # No trigger logic needed - hold until market resolution
     
-    async def _check_opportunity_fast(self, price_data: Dict):
+    async def _scan_and_place_future_orders(self):
         """
-        FAST PATH: Check for trading opportunity with minimal overhead.
-        Market is already locked, no discovery needed.
+        Scan for new future markets and place orders immediately.
+        This ensures MAXIMUM FIFO priority by placing orders as soon as
+        markets are created (up to 24h before they become active).
         """
-        # Block buys in the last minute before market ends
-        if self.market_end_time:
-            et_tz = pytz.timezone('America/New_York')
-            now_et = datetime.now(et_tz)
-            
-            if self.market_end_time.tzinfo is None:
-                market_end_et = et_tz.localize(self.market_end_time)
-            else:
-                market_end_et = self.market_end_time.astimezone(et_tz)
-            
-            # No buys allowed within 1 minute of market end
-            cutoff_time = market_end_et - timedelta(minutes=1)
-            if now_et >= cutoff_time:
-                return  # Too close to market end, skip buy
+        now = time.time()
         
-        up_price = price_data['up_price']
-        down_price = price_data['down_price']
-        up_token = price_data['up_token_id']
-        down_token = price_data['down_token_id']
-        market = price_data['market']
-        market_id = market.get('conditionId', '')[:10]
-        
-        # Check if we already have a position
-        existing_positions = self.trader.get_all_positions()
-        if up_token in existing_positions or down_token in existing_positions:
-            return  # Already have position
-        
-        # Skip if we exceeded max attempts for this market
-        attempts = self.market_attempts.get(market_id, 0)
-        if attempts >= MAX_ATTEMPTS_PER_MARKET:
+        # Only scan periodically to respect rate limits
+        if now - self.last_future_scan < self.future_scan_interval:
             return
         
-        # Check trigger conditions
-        trade_side = self.trader.get_trade_side(up_price, down_price, TRIGGER_PRICE)
+        self.last_future_scan = now
         
-        if trade_side:
-            # TRIGGER HIT - Execute immediately using PRE-SIGNED order
-
-
-            token_id = up_token if trade_side == 'up' else down_token
-            current_price = up_price if trade_side == 'up' else down_price
-
-            # logger.info(f"TRIGGER: {trade_side.upper()} @ ${current_price:.4f} (attempt {attempts + 1}/{MAX_ATTEMPTS_PER_MARKET})")
-
-            # Increment attempt counter BEFORE placing order
-            self.market_attempts[market_id] = attempts + 1
-
-            # Execute trade using PRE-SIGNED order (FAST PATH)
-            # GTC = Good Till Cancelled - limit order waits in orderbook
-            order = self.trader.execute_presigned_buy(
-                token_id=token_id,
-                side=trade_side,
-                price=ENTRY_PRICE,
-                size=MAX_POSITION_SIZE,
-                market_info=market,
-                order_type="GTC"  # Limit order - waits in orderbook
-            )
-
-            if order:
-                # No stop loss - hold until market resolution
-                # Reset attempts on success (order placed)
-                self.market_attempts[market_id] = MAX_ATTEMPTS_PER_MARKET
+        try:
+            # Get all future markets (up to 24h ahead)
+            future_markets = await self.monitor.get_future_markets(self.future_scan_hours)
+            
+            if not future_markets:
+                return
+            
+            # Find markets where we haven't placed orders yet
+            new_markets = []
+            for market_data in future_markets:
+                condition_id = market_data['condition_id']
+                if condition_id and condition_id not in self.orders_placed_markets:
+                    new_markets.append(market_data)
+            
+            if new_markets:
+                logger.info(f"Found {len(new_markets)} NEW future markets without orders")
+                
+                # Place orders on each new market
+                for market_data in new_markets:
+                    await self._place_orders_on_market(market_data)
+                    # Small delay between markets to avoid rate limits
+                    await asyncio.sleep(0.5)
+                    
+        except Exception as e:
+            logger.error(f"Error scanning future markets: {e}")
+    
+    async def _place_orders_on_market(self, market_data: Dict):
+        """
+        Place both UP and DOWN limit orders on a market.
+        Called for both current and future markets.
+        """
+        condition_id = market_data['condition_id']
+        up_token = market_data['up_token_id']
+        down_token = market_data['down_token_id']
+        start_time = market_data['start_time']
+        market = market_data['market']
+        
+        # Format start time for logging
+        et_tz = pytz.timezone('America/New_York')
+        start_et = start_time.astimezone(et_tz)
+        time_until = start_time - datetime.now(pytz.UTC)
+        hours_until = time_until.total_seconds() / 3600
+        
+        logger.info(f"NEW MARKET DETECTED: {market_data['question'][:50]}...")
+        logger.info(f"  Starts: {start_et.strftime('%Y-%m-%d %H:%M')} ET ({hours_until:.1f}h from now)")
+        logger.info(f"  Placing orders @ ${ENTRY_PRICE:.2f}...")
+        
+        # Place UP order
+        up_order = self.trader.place_buy_order(
+            token_id=up_token,
+            side='up',
+            price=ENTRY_PRICE,
+            size=MAX_POSITION_SIZE,
+            market_info=market,
+            order_type="GTC"
+        )
+        
+        if up_order:
+            logger.info(f"  UP order placed - Size: {MAX_POSITION_SIZE}")
+        else:
+            logger.warning(f"  Failed to place UP order")
+        
+        # Place DOWN order
+        down_order = self.trader.place_buy_order(
+            token_id=down_token,
+            side='down',
+            price=ENTRY_PRICE,
+            size=MAX_POSITION_SIZE,
+            market_info=market,
+            order_type="GTC"
+        )
+        
+        if down_order:
+            logger.info(f"  DOWN order placed - Size: {MAX_POSITION_SIZE}")
+        else:
+            logger.warning(f"  Failed to place DOWN order")
+        
+        # Mark market as processed (even if orders failed, to avoid retry spam)
+        self.orders_placed_markets.add(condition_id)
+        
+        if up_order and down_order:
+            logger.info(f"  Both orders queued - MAXIMUM PRIORITY secured!")
+        
+        # Log total markets with orders
+        logger.info(f"  Total markets with orders: {len(self.orders_placed_markets)}")
+    
+    async def _recover_orders_state(self):
+        """
+        Recover state from Polymarket on startup.
+        Checks which markets already have open orders to avoid duplicates.
+        
+        This survives app restarts by querying the actual orderbook state.
+        """
+        logger.info("Recovering orders state from Polymarket...")
+        
+        try:
+            # Get token IDs with open orders
+            open_token_ids = self.trader.get_open_order_token_ids()
+            
+            if not open_token_ids:
+                logger.info("No existing open orders found - starting fresh")
+                return
+            
+            logger.info(f"Found {len(open_token_ids)} tokens with open orders")
+            
+            # Scan future markets to map token_ids -> condition_ids
+            future_markets = await self.monitor.get_future_markets(self.future_scan_hours)
+            
+            # Also get current active markets
+            current_markets = await self.monitor.get_all_market_prices()
+            
+            # Build token -> condition_id mapping
+            token_to_condition = {}
+            
+            for market_data in future_markets:
+                condition_id = market_data['condition_id']
+                token_to_condition[market_data['up_token_id']] = condition_id
+                token_to_condition[market_data['down_token_id']] = condition_id
+            
+            for price_data in current_markets:
+                condition_id = price_data['market'].get('conditionId')
+                if condition_id:
+                    token_to_condition[price_data['up_token_id']] = condition_id
+                    token_to_condition[price_data['down_token_id']] = condition_id
+            
+            # Find condition_ids for our open orders
+            recovered_markets = set()
+            for token_id in open_token_ids:
+                condition_id = token_to_condition.get(token_id)
+                if condition_id:
+                    recovered_markets.add(condition_id)
+            
+            # Add to our tracking set
+            self.orders_placed_markets.update(recovered_markets)
+            
+            logger.info(f"Recovered {len(recovered_markets)} markets with existing orders")
+            logger.info(f"Total markets tracked: {len(self.orders_placed_markets)}")
+            
+        except Exception as e:
+            logger.error(f"Error recovering orders state: {e}")
+            logger.info("Continuing with empty state - may place duplicate orders")
     
     async def _periodic_redeem(self):
         """Periodically check for redeemable positions"""

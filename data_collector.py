@@ -62,7 +62,7 @@ class DataCollector:
         self.api_url = api_url
         self.current_market: Optional[MarketData] = None
         self.last_record_time: float = 0
-        self.record_interval: float = 1.0  # Record every 1 second
+        self.record_interval: float = 0.5  # Record every 1 second
         self.et_tz = pytz.timezone('America/New_York')
         
         # Async client for sending data
