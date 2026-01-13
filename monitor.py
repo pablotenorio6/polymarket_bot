@@ -74,7 +74,7 @@ class FastMarketMonitor:
     - Fresh (use_persistent_client=False): For sync wrappers, creates new client each call
     """
     
-    def __init__(self, use_persistent_client: bool = False):
+    def __init__(self, use_persistent_client: bool = False, market_prefix: str = "btc-updown-15m-"):
         self.et_tz = pytz.timezone('America/New_York')
         
         # Client mode
@@ -95,11 +95,9 @@ class FastMarketMonitor:
         self.price_cache: Dict[str, float] = {}  # token_id -> price
         self.last_price_update: Optional[datetime] = None
         
-        # Market slugs to monitor (expandable for ETH, SOL, etc.)
-        self.market_prefixes = [
-            "btc-updown-15m-",
-            # Future: "eth-updown-15m-", "sol-updown-15m-"
-        ]
+        # Market prefix to monitor (configurable per instance)
+        self.market_prefixes = [market_prefix]
+        logger.debug(f"Monitor initialized for market prefix: {market_prefix}")
     
     async def close(self):
         """Clean up resources"""

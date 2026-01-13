@@ -6,9 +6,20 @@ Performance optimizations:
 2. Non-blocking order execution
 3. Minimal processing between price update and trade decision
 4. Efficient position management
+
+Usage:
+    # Bitcoin trading mode (default)
+    python main.py
+    
+    # Ethereum monitor-only mode
+    python main.py --market eth --mode monitor
+    
+    # Solana trading mode
+    python main.py --market sol --mode trade
 """
 
 import asyncio
+import argparse
 import signal
 import sys
 import logging
@@ -17,27 +28,84 @@ from typing import Dict, Optional, Set
 from datetime import datetime, timedelta
 import pytz
 
-# Configure logging first
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    datefmt='%H:%M:%S',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('trading_bot.log')
-    ]
-)
-
-logger = logging.getLogger(__name__)
-
-# Reduce noise from other libraries
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('httpcore').setLevel(logging.WARNING)
-logging.getLogger('py_clob_client').setLevel(logging.WARNING)
-
 from config import (
-    ENTRY_PRICE, MAX_POSITION_SIZE, POLL_INTERVAL
+    ENTRY_PRICE, MAX_POSITION_SIZE, POLL_INTERVAL,
+    AVAILABLE_MARKETS, BOT_MODES, DEFAULT_MARKET, DEFAULT_MODE
 )
+
+
+def setup_logging(market: str, mode: str):
+    """Configure logging with market-specific log file"""
+    log_file = f'trading_bot_{market}_{mode}.log'
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f'%(asctime)s | {market.upper()} | %(levelname)s | %(message)s',
+        datefmt='%H:%M:%S',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file)
+        ]
+    )
+    
+    # Reduce noise from other libraries
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
+    logging.getLogger('py_clob_client').setLevel(logging.WARNING)
+    
+    return logging.getLogger(__name__)
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Polymarket Crypto Trading Bot',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py                          # BTC trading mode (default)
+  python main.py --market eth             # ETH trading mode  
+  python main.py --market sol --mode monitor  # SOL monitor-only
+  python main.py -m btc -M trade          # Short form
+        """
+    )
+    
+    parser.add_argument(
+        '-m', '--market',
+        type=str,
+        choices=list(AVAILABLE_MARKETS.keys()),
+        default=DEFAULT_MARKET,
+        help=f'Crypto market to monitor/trade (default: {DEFAULT_MARKET})'
+    )
+    
+    parser.add_argument(
+        '-M', '--mode',
+        type=str,
+        choices=list(BOT_MODES.keys()),
+        default=DEFAULT_MODE,
+        help=f'Bot operation mode (default: {DEFAULT_MODE})'
+    )
+    
+    parser.add_argument(
+        '--size',
+        type=float,
+        default=MAX_POSITION_SIZE,
+        help=f'Position size in USD (default: {MAX_POSITION_SIZE})'
+    )
+    
+    parser.add_argument(
+        '--price',
+        type=float,
+        default=ENTRY_PRICE,
+        help=f'Entry price for limit orders (default: {ENTRY_PRICE})'
+    )
+    
+    return parser.parse_args()
+
+
+# Parse args before importing other modules that might log
+args = parse_args()
+logger = setup_logging(args.market, args.mode)
 
 
 from monitor import FastMarketMonitor
@@ -56,16 +124,45 @@ class FastTradingBot:
     - FAST LOOP: When market locked, only fetch 2 token prices
     - SLOW LOOP: Market discovery and redeem (every 15 min)
     - Pre-signed orders for instant execution
+    
+    Args:
+        market: Crypto market to trade ('btc', 'eth', 'sol')
+        mode: Operation mode ('monitor' or 'trade')
+        position_size: Size of orders in USD
+        entry_price: Price for limit orders
     """
     
-    def __init__(self):
-        logger.info("=" * 50)
-        logger.info("POLYMARKET FAST TRADING BOT")
-        logger.info("=" * 50)
-        logger.info(f"Strategy: BTC 15-min Up/Down - MAXIMUM PRIORITY")
-        logger.info(f"Scan future markets & place orders immediately @ ${ENTRY_PRICE:.2f}")
-        logger.info(f"Hold until resolution | Size: ${MAX_POSITION_SIZE}")
-        logger.info("=" * 50)
+    def __init__(
+        self,
+        market: str = DEFAULT_MARKET,
+        mode: str = DEFAULT_MODE,
+        position_size: float = MAX_POSITION_SIZE,
+        entry_price: float = ENTRY_PRICE
+    ):
+        # Store configuration
+        self.market = market
+        self.mode = mode
+        self.position_size = position_size
+        self.entry_price = entry_price
+        self.trading_enabled = (mode == "trade")
+        
+        # Get market info
+        market_info = AVAILABLE_MARKETS.get(market, AVAILABLE_MARKETS["btc"])
+        self.market_prefix = market_info["prefix"]
+        self.market_name = market_info["name"]
+        self.market_symbol = market_info["symbol"]
+        
+        # Display configuration
+        logger.info("=" * 60)
+        logger.info("POLYMARKET CRYPTO BOT")
+        logger.info("=" * 60)
+        logger.info(f"Market: {self.market_name} ({self.market_symbol}) 15-min Up/Down")
+        logger.info(f"Mode: {mode.upper()} - {BOT_MODES[mode]}")
+        if self.trading_enabled:
+            logger.info(f"Entry Price: ${entry_price:.3f} | Size: ${position_size}")
+        else:
+            logger.info("Trading DISABLED - Monitor only")
+        logger.info("=" * 60)
         
         # === ORDERS TRACKING ===
         # Set of condition_ids where we've already placed orders
@@ -77,7 +174,11 @@ class FastTradingBot:
         self.future_scan_interval = 60  # Scan every 60 seconds
         
         # Core components (use persistent client for best performance)
-        self.monitor = FastMarketMonitor(use_persistent_client=True)
+        # Pass market prefix to monitor
+        self.monitor = FastMarketMonitor(
+            use_persistent_client=True,
+            market_prefix=self.market_prefix
+        )
         self.trader = FastTrader()
         self.risk_manager = FastRiskManager(self.trader)  # Inject trader
         self.redeem_manager = RedeemManager()
@@ -121,16 +222,20 @@ class FastTradingBot:
                 self.use_websocket = False
         
         # Recover state from open orders (survives restarts)
-        await self._recover_orders_state()
+        # Only needed if trading is enabled
+        if self.trading_enabled:
+            await self._recover_orders_state()
         
-        logger.info("Starting trading loop...")
+        logger.info(f"Starting {'trading' if self.trading_enabled else 'monitoring'} loop...")
         
         while self.running:
             loop_start = time.perf_counter()
             
             try:
                 # === TASK 1: Scan for NEW future markets and place orders ===
-                await self._scan_and_place_future_orders()
+                # Only scan and place orders if trading is enabled
+                if self.trading_enabled:
+                    await self._scan_and_place_future_orders()
                 
                 # === TASK 2: Monitor current active market for price data ===
                 # Check if we need to find/refresh current market
@@ -264,7 +369,7 @@ class FastTradingBot:
             # when the market is first detected (before it becomes active)
         
         # Periodic redeem (only on slow path)
-        await self._periodic_redeem()
+        # await self._periodic_redeem()
     
     async def _fast_iteration(self):
         """
@@ -371,20 +476,20 @@ class FastTradingBot:
         
         logger.info(f"NEW MARKET DETECTED: {market_data['question'][:50]}...")
         logger.info(f"  Starts: {start_et.strftime('%Y-%m-%d %H:%M')} ET ({hours_until:.1f}h from now)")
-        logger.info(f"  Placing orders @ ${ENTRY_PRICE:.2f}...")
+        logger.info(f"  Placing orders @ ${self.entry_price:.3f}...")
         
         # Place UP order
         up_order = self.trader.place_buy_order(
             token_id=up_token,
             side='up',
-            price=ENTRY_PRICE,
-            size=MAX_POSITION_SIZE,
+            price=self.entry_price,
+            size=self.position_size,
             market_info=market,
             order_type="GTC"
         )
         
         if up_order:
-            logger.info(f"  UP order placed - Size: {MAX_POSITION_SIZE}")
+            logger.info(f"  UP order placed - Size: {self.position_size}")
         else:
             logger.warning(f"  Failed to place UP order")
         
@@ -392,14 +497,14 @@ class FastTradingBot:
         down_order = self.trader.place_buy_order(
             token_id=down_token,
             side='down',
-            price=ENTRY_PRICE,
-            size=MAX_POSITION_SIZE,
+            price=self.entry_price,
+            size=self.position_size,
             market_info=market,
             order_type="GTC"
         )
         
         if down_order:
-            logger.info(f"  DOWN order placed - Size: {MAX_POSITION_SIZE}")
+            logger.info(f"  DOWN order placed - Size: {self.position_size}")
         else:
             logger.warning(f"  Failed to place DOWN order")
         
@@ -507,7 +612,13 @@ class FastTradingBot:
 
 async def main():
     """Entry point with signal handling"""
-    bot = FastTradingBot()
+    # Create bot with CLI arguments
+    bot = FastTradingBot(
+        market=args.market,
+        mode=args.mode,
+        position_size=args.size,
+        entry_price=args.price
+    )
     
     # Handle shutdown signals
     loop = asyncio.get_running_loop()

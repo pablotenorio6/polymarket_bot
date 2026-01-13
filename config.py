@@ -39,15 +39,36 @@ REQUEST_TIMEOUT = 5  # HTTP request timeout
 #   - Total: ~50 req/s (well within limits)
 
 # ============================================
-# MULTI-MARKET SUPPORT (Future)
+# MULTI-MARKET SUPPORT
 # ============================================
-# Crypto markets to monitor (slug prefixes)
-# Each market adds ~4 requests per loop cycle
-ENABLED_MARKETS = [
-    "btc-updown-15m-",  # Bitcoin
-    # "eth-updown-15m-",  # Ethereum (uncomment when ready)
-    # "sol-updown-15m-",  # Solana (uncomment when ready)
-]
+# Available crypto markets (slug prefixes)
+AVAILABLE_MARKETS = {
+    "btc": {
+        "prefix": "btc-updown-15m-",
+        "name": "Bitcoin",
+        "symbol": "BTC"
+    },
+    "eth": {
+        "prefix": "eth-updown-15m-",
+        "name": "Ethereum", 
+        "symbol": "ETH"
+    },
+    "sol": {
+        "prefix": "sol-updown-15m-",
+        "name": "Solana",
+        "symbol": "SOL"
+    }
+}
+
+# Bot operation modes
+BOT_MODES = {
+    "monitor": "Only collect price data, no trading",
+    "trade": "Collect data AND place orders on new markets"
+}
+
+# Default market (can be overridden via CLI or env var)
+DEFAULT_MARKET = os.getenv("BOT_MARKET", "btc")
+DEFAULT_MODE = os.getenv("BOT_MODE", "trade")
 
 # Authentication (REQUIRED for trading)
 # Set these environment variables in your .env file:

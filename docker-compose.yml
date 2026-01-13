@@ -1,22 +1,108 @@
 services:
-  polymarket-bot:
+  # ============================================
+  # TRADING BOTS - Place orders on new markets
+  # ============================================
+  
+  bot-btc-trade:
     build: .
-    container_name: polymarket-trading-bot
+    container_name: polymarket-btc-trade
     restart: unless-stopped
-    
-    # Environment variables (use .env file or set here)
     env_file:
       - .env
-    
-    # Or override with original version:
-    # environment:
-    #   - BOT_ENTRYPOINT=main.py
-    
-    # Mount logs directory
+    environment:
+      - BOT_MARKET=btc
+      - BOT_MODE=trade
+    command: python main.py --market btc --mode trade
     volumes:
       - ./logs:/app/logs
-    
-    # Keep container running and show logs
     tty: true
     stdin_open: true
 
+  bot-eth-trade:
+    build: .
+    container_name: polymarket-eth-trade
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_MARKET=eth
+      - BOT_MODE=trade
+    command: python main.py --market eth --mode trade
+    volumes:
+      - ./logs:/app/logs
+    tty: true
+    stdin_open: true
+    profiles:
+      - eth  # Only start with: docker compose --profile eth up
+
+  bot-sol-trade:
+    build: .
+    container_name: polymarket-sol-trade
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_MARKET=sol
+      - BOT_MODE=trade
+    command: python main.py --market sol --mode trade
+    volumes:
+      - ./logs:/app/logs
+    tty: true
+    stdin_open: true
+    profiles:
+      - sol  # Only start with: docker compose --profile sol up
+
+  # ============================================
+  # MONITOR BOTS - Only collect price data
+  # ============================================
+  
+  bot-btc-monitor:
+    build: .
+    container_name: polymarket-btc-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_MARKET=btc
+      - BOT_MODE=monitor
+    command: python main.py --market btc --mode monitor
+    volumes:
+      - ./logs:/app/logs
+    tty: true
+    stdin_open: true
+    profiles:
+      - monitor  # Only start with: docker compose --profile monitor up
+
+  bot-eth-monitor:
+    build: .
+    container_name: polymarket-eth-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_MARKET=eth
+      - BOT_MODE=monitor
+    command: python main.py --market eth --mode monitor
+    volumes:
+      - ./logs:/app/logs
+    tty: true
+    stdin_open: true
+    profiles:
+      - monitor
+
+  bot-sol-monitor:
+    build: .
+    container_name: polymarket-sol-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_MARKET=sol
+      - BOT_MODE=monitor
+    command: python main.py --market sol --mode monitor
+    volumes:
+      - ./logs:/app/logs
+    tty: true
+    stdin_open: true
+    profiles:
+      - monitor
