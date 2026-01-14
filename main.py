@@ -114,6 +114,7 @@ from risk_manager import FastRiskManager
 from redeem import RedeemManager
 from ws_monitor import HybridPriceMonitor
 from data_collector import DataCollector
+from rtds_crypto_prices import RTDSCryptoPrices
 
 
 class FastTradingBot:
@@ -190,6 +191,9 @@ class FastTradingBot:
         # Data collector for price history
         self.data_collector = DataCollector()
         
+        # RTDS client for real-time BTC price from Polymarket
+        self.rtds_client: Optional[RTDSCryptoPrices] = None
+        
         # State tracking
         self.running = False
         self.last_market_id: Optional[str] = None
@@ -212,6 +216,15 @@ class FastTradingBot:
     async def run(self):
         """Main async trading loop with FAST PATH optimization"""
         self.running = True
+        
+        # Start RTDS client for real-time crypto price from Polymarket
+        self.rtds_client = RTDSCryptoPrices()
+        if await self.rtds_client.start():
+            crypto_symbol = self.market.upper()  # btc -> BTC, eth -> ETH, sol -> SOL
+            logger.info(f"RTDS connected - real-time {crypto_symbol} price enabled")
+            self.data_collector.set_rtds_client(self.rtds_client, crypto_symbol)
+        else:
+            logger.warning("RTDS connection failed - crypto price will not be recorded")
         
         # Start WebSocket connection for real-time prices
         if self.use_websocket:
@@ -596,6 +609,10 @@ class FastTradingBot:
             await self.data_collector.save_market()
         
         await self.data_collector.close()
+        
+        # Close RTDS connection
+        if self.rtds_client:
+            await self.rtds_client.close()
         
         # Close WebSocket connection
         if self.use_websocket:

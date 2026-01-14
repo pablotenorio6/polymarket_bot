@@ -15,7 +15,6 @@ import pytz
 import asyncio
 
 from config import DATA_COLLECTOR_API_URL
-from chainlink_price import get_btc_price, get_price_feed
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +24,7 @@ class PriceSnapshot:
     timestamp: datetime
     up_price: float
     down_price: float
-    # btc_price: Optional[float] = None  # BTC price from Chainlink
+    crypto_price: Optional[float] = None  # Crypto price from Polymarket RTDS
 
 
 @dataclass
@@ -62,15 +61,15 @@ class DataCollector:
         self.api_url = api_url
         self.current_market: Optional[MarketData] = None
         self.last_record_time: float = 0
-        self.record_interval: float = 0.5  # Record every 1 second
+        self.record_interval: float = 0.5  # Record every 0.5 seconds
         self.et_tz = pytz.timezone('America/New_York')
         
         # Async client for sending data
         self._client: Optional[httpx.AsyncClient] = None
         
-        # Initialize Chainlink price feed for BTC
-        # self._price_feed = get_price_feed()
-        # logger.info("[DataCollector] Chainlink BTC price feed initialized")
+        # RTDS client for crypto price (set via set_rtds_client)
+        self._rtds_client = None
+        self._crypto_symbol = "BTC"  # Default symbol, set via set_rtds_client
     
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create async HTTP client"""
@@ -82,6 +81,18 @@ class DataCollector:
         """Close HTTP client"""
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+    
+    def set_rtds_client(self, rtds_client, crypto_symbol: str = "BTC"):
+        """
+        Set the RTDS client for crypto price feeds.
+        
+        Args:
+            rtds_client: RTDSCryptoPrices instance
+            crypto_symbol: Crypto symbol to track (BTC, ETH, SOL)
+        """
+        self._rtds_client = rtds_client
+        self._crypto_symbol = crypto_symbol.upper()
+        logger.info(f"[DataCollector] RTDS {self._crypto_symbol} price feed connected")
     
     def start_market(
         self,
@@ -126,15 +137,18 @@ class DataCollector:
         if now - self.last_record_time < self.record_interval:
             return False
         
-        # Get current BTC price from Chainlink
-        # btc_price = self._price_feed.get_btc_price()
+        # Get current crypto price from Polymarket RTDS
+        crypto_price = None
+        if self._rtds_client:
+            crypto_price = self._rtds_client.get_price(self._crypto_symbol)
         
-        # Create snapshot with current timestamp and BTC price
+        # Create snapshot with current timestamp and crypto price
+        # Round to 4 decimals for precision
         snapshot = PriceSnapshot(
             timestamp=datetime.now(self.et_tz),
-            up_price=up_price,
-            down_price=down_price
-            # btc_price=btc_price
+            up_price=round(up_price, 4),
+            down_price=round(down_price, 4),
+            crypto_price=round(crypto_price, 2) if crypto_price else None
         )
         
         self.current_market.snapshots.append(snapshot)
@@ -171,12 +185,13 @@ class DataCollector:
             "up_token_id": self.current_market.up_token_id,
             "down_token_id": self.current_market.down_token_id,
             "winner": self.current_market.winner,
+            "crypto_symbol": self._crypto_symbol,  # BTC, ETH, SOL
             "snapshots": [
                 {
                     "timestamp": s.timestamp.isoformat(),
-                    "up_price": s.up_price,
-                    "down_price": s.down_price
-                    # "btc_price": s.btc_price  # BTC price from Chainlink
+                    "up_price": round(s.up_price, 4),
+                    "down_price": round(s.down_price, 4),
+                    "crypto_price": s.crypto_price  # Price from Polymarket RTDS
                 }
                 for s in self.current_market.snapshots
             ]
