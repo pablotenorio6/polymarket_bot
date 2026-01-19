@@ -106,3 +106,48 @@ services:
     stdin_open: true
     profiles:
       - monitor
+
+  # ============================================
+  # WHALE COPY STRATEGY - Copy whale trades
+  # Monitors all crypto markets automatically
+  # ============================================
+  
+  bot-whale-copy:
+    build: .
+    container_name: polymarket-whale-copy
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_MARKET=btc
+      - BOT_MODE=trade
+      - BOT_STRATEGY=whale_copy
+    command: python main.py --market btc --mode trade --strategy whale_copy
+    tty: true
+    stdin_open: true
+    profiles:
+      - whale  # Start with: docker compose --profile whale up
+
+  # ============================================
+  # EXPECTED VALUE STRATEGY - EV-based trading
+  # ============================================
+  
+  bot-btc-ev:
+    build: .
+    container_name: polymarket-btc-ev
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_MARKET=btc
+      - BOT_MODE=trade
+      - BOT_STRATEGY=expected_value
+    command: python main.py --market btc --mode trade --strategy expected_value
+    volumes:
+      - ./logs:/app/logs
+    tty: true
+    stdin_open: true
+    profiles:
+      - ev  # Start with: docker compose --profile ev up
+
+ 
