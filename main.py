@@ -1,5 +1,5 @@
 """
-Optimized main trading bot with async operations
+Optimized main trading bot with async operations and pluggable strategies
 
 Performance optimizations:
 1. Async market monitoring with batch price fetching
@@ -7,15 +7,20 @@ Performance optimizations:
 3. Minimal processing between price update and trade decision
 4. Efficient position management
 
+Strategy system:
+- Strategies define HOW to trade (when to place orders, at what price)
+- Bot provides infrastructure (monitors, trader, data collection)
+- Switch strategies via --strategy parameter
+
 Usage:
-    # Bitcoin trading mode (default)
+    # Bitcoin trading mode with early_queue strategy (default)
     python main.py
     
     # Ethereum monitor-only mode
     python main.py --market eth --mode monitor
     
-    # Solana trading mode
-    python main.py --market sol --mode trade
+    # Different strategy
+    python main.py --market btc --mode trade --strategy early_queue
 """
 
 import asyncio
@@ -32,19 +37,17 @@ from config import (
     ENTRY_PRICE, MAX_POSITION_SIZE, POLL_INTERVAL,
     AVAILABLE_MARKETS, BOT_MODES, DEFAULT_MARKET, DEFAULT_MODE
 )
+from strategies import get_strategy, STRATEGIES
 
 
 def setup_logging(market: str, mode: str):
-    """Configure logging with market-specific log file"""
-    log_file = f'trading_bot_{market}_{mode}.log'
-    
+    """Configure logging (console only, no file)"""
     logging.basicConfig(
         level=logging.INFO,
         format=f'%(asctime)s | {market.upper()} | %(levelname)s | %(message)s',
         datefmt='%H:%M:%S',
         handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file)
+            logging.StreamHandler(sys.stdout)
         ]
     )
     
@@ -100,6 +103,14 @@ Examples:
         help=f'Entry price for limit orders (default: {ENTRY_PRICE})'
     )
     
+    parser.add_argument(
+        '-s', '--strategy',
+        type=str,
+        choices=list(STRATEGIES.keys()),
+        default='early_queue',
+        help='Trading strategy to use (default: early_queue)'
+    )
+    
     return parser.parse_args()
 
 
@@ -119,18 +130,19 @@ from rtds_crypto_prices import RTDSCryptoPrices
 
 class FastTradingBot:
     """
-    High-performance async trading bot
+    High-performance async trading bot with pluggable strategies
     
     Architecture:
     - FAST LOOP: When market locked, only fetch 2 token prices
     - SLOW LOOP: Market discovery and redeem (every 15 min)
-    - Pre-signed orders for instant execution
+    - Strategy system: Strategies define trading logic
     
     Args:
         market: Crypto market to trade ('btc', 'eth', 'sol')
         mode: Operation mode ('monitor' or 'trade')
         position_size: Size of orders in USD
         entry_price: Price for limit orders
+        strategy_name: Name of strategy to use
     """
     
     def __init__(
@@ -138,13 +150,15 @@ class FastTradingBot:
         market: str = DEFAULT_MARKET,
         mode: str = DEFAULT_MODE,
         position_size: float = MAX_POSITION_SIZE,
-        entry_price: float = ENTRY_PRICE
+        entry_price: float = ENTRY_PRICE,
+        strategy_name: str = "early_queue"
     ):
         # Store configuration
         self.market = market
         self.mode = mode
         self.position_size = position_size
         self.entry_price = entry_price
+        self.strategy_name = strategy_name
         self.trading_enabled = (mode == "trade")
         
         # Get market info
@@ -159,15 +173,12 @@ class FastTradingBot:
         logger.info("=" * 60)
         logger.info(f"Market: {self.market_name} ({self.market_symbol}) 15-min Up/Down")
         logger.info(f"Mode: {mode.upper()} - {BOT_MODES[mode]}")
+        logger.info(f"Strategy: {strategy_name}")
         if self.trading_enabled:
             logger.info(f"Entry Price: ${entry_price:.3f} | Size: ${position_size}")
         else:
             logger.info("Trading DISABLED - Monitor only")
         logger.info("=" * 60)
-        
-        # === ORDERS TRACKING ===
-        # Set of condition_ids where we've already placed orders
-        self.orders_placed_markets: Set[str] = set()
         
         # Future market scanning config
         self.future_scan_hours = 24  # Scan 24 hours ahead
@@ -191,8 +202,11 @@ class FastTradingBot:
         # Data collector for price history
         self.data_collector = DataCollector()
         
-        # RTDS client for real-time BTC price from Polymarket
+        # RTDS client for real-time crypto price from Polymarket
         self.rtds_client: Optional[RTDSCryptoPrices] = None
+        
+        # Strategy instance (created after RTDS is connected)
+        self.strategy = None
         
         # State tracking
         self.running = False
@@ -217,27 +231,54 @@ class FastTradingBot:
         """Main async trading loop with FAST PATH optimization"""
         self.running = True
         
-        # Start RTDS client for real-time crypto price from Polymarket
-        self.rtds_client = RTDSCryptoPrices()
-        if await self.rtds_client.start():
-            crypto_symbol = self.market.upper()  # btc -> BTC, eth -> ETH, sol -> SOL
-            logger.info(f"RTDS connected - real-time {crypto_symbol} price enabled")
-            self.data_collector.set_rtds_client(self.rtds_client, crypto_symbol)
-        else:
-            logger.warning("RTDS connection failed - crypto price will not be recorded")
+        # Get strategy class to check its requirements
+        StrategyClass = get_strategy(self.strategy_name)
         
-        # Start WebSocket connection for real-time prices
-        if self.use_websocket:
-            if await self.ws_monitor.start():
-                logger.info("WebSocket connected - real-time prices enabled")
+        # Start RTDS client for real-time crypto price (if strategy needs it)
+        if StrategyClass.requires_rtds:
+            self.rtds_client = RTDSCryptoPrices()
+            if await self.rtds_client.start():
+                crypto_symbol = self.market.upper()  # btc -> BTC, eth -> ETH, sol -> SOL
+                logger.info(f"RTDS connected - real-time {crypto_symbol} price enabled")
+                if StrategyClass.requires_data_collector:
+                    self.data_collector.set_rtds_client(self.rtds_client, crypto_symbol)
             else:
-                logger.warning("WebSocket failed, falling back to HTTP polling")
-                self.use_websocket = False
+                logger.warning("RTDS connection failed - crypto price will not be recorded")
+        else:
+            logger.info("Strategy does not require RTDS - skipping")
         
-        # Recover state from open orders (survives restarts)
-        # Only needed if trading is enabled
+        # Start WebSocket connection for real-time prices (if strategy needs it)
+        if StrategyClass.requires_price_websocket:
+            if self.use_websocket:
+                if await self.ws_monitor.start():
+                    logger.info("WebSocket connected - real-time prices enabled")
+                else:
+                    logger.warning("WebSocket failed, falling back to HTTP polling")
+                    self.use_websocket = False
+        else:
+            logger.info("Strategy does not require price WebSocket - skipping")
+            self.use_websocket = False
+        
+        # Set data collector flag (used throughout the bot)
+        self._data_collector_enabled = StrategyClass.requires_data_collector
+        if not self._data_collector_enabled:
+            logger.info("Strategy does not require data collector - disabled")
+        
+        # Create strategy instance
+        self.strategy = StrategyClass(
+            trader=self.trader,
+            monitor=self.monitor,
+            ws_monitor=self.ws_monitor,
+            data_collector=self.data_collector,
+            rtds_client=self.rtds_client,
+            market_symbol=self.market_symbol,
+            entry_price=self.entry_price,
+            position_size=self.position_size,
+        )
+        
+        # Initialize strategy (recover state, etc.) - only if trading enabled
         if self.trading_enabled:
-            await self._recover_orders_state()
+            await self.strategy.initialize()
         
         logger.info(f"Starting {'trading' if self.trading_enabled else 'monitoring'} loop...")
         
@@ -307,11 +348,11 @@ class FastTradingBot:
     async def _refresh_market(self):
         """SLOW PATH: Find new market and set up (runs every ~15 min)"""
         # Save previous market data if it expired
-        if getattr(self, '_market_expired', False) and self.data_collector.has_active_market():
+        if getattr(self, '_market_expired', False):
             # Determine winner based on last known prices
             winner = None
             if self.locked_up_token and self.locked_down_token:
-                prices = self.ws_monitor.get_prices()
+                prices = self.ws_monitor.get_prices() if self.use_websocket else {}
                 if prices:
                     up_price = prices.get(self.locked_up_token, 0)
                     down_price = prices.get(self.locked_down_token, 0)
@@ -320,7 +361,18 @@ class FastTradingBot:
                     elif down_price > 0.5:
                         winner = 'DOWN'
             
-            await self.data_collector.save_market(winner=winner)
+            # Notify strategy of market end
+            if self.strategy and self.locked_market:
+                await self.strategy.on_market_end(
+                    market_data={'condition_id': self.locked_market.get('conditionId'), 
+                                 'question': self.locked_market.get('question', ''),
+                                 'slug': self.locked_market.get('slug', '')},
+                    winner=winner
+                )
+            
+            # Save data if collector is enabled
+            if self._data_collector_enabled and self.data_collector.has_active_market():
+                await self.data_collector.save_market(winner=winner)
             self._market_expired = False
         
         # Clear locked state
@@ -368,18 +420,28 @@ class FastTradingBot:
                     self.locked_down_token
                 )
             
-            # Start collecting price data for this market
-            self.data_collector.start_market(
-                condition_id=market.get('conditionId', ''),
-                question=market.get('question', 'Unknown'),
-                up_token_id=self.locked_up_token,
-                down_token_id=self.locked_down_token,
-                start_time=datetime.now(et_tz),
-                end_time=self.market_end_time
-            )
+            # Start collecting price data for this market (if enabled)
+            if self._data_collector_enabled:
+                self.data_collector.start_market(
+                    condition_id=market.get('conditionId', ''),
+                    question=market.get('question', 'Unknown'),
+                    up_token_id=self.locked_up_token,
+                    down_token_id=self.locked_down_token,
+                    start_time=datetime.now(et_tz),
+                    end_time=self.market_end_time
+                )
             
-            # Orders are now placed by _scan_and_place_future_orders
-            # when the market is first detected (before it becomes active)
+            # Notify strategy that market is now active
+            if self.strategy and self.trading_enabled:
+                await self.strategy.on_market_active({
+                    'condition_id': market.get('conditionId', ''),
+                    'question': market.get('question', 'Unknown'),
+                    'up_token_id': self.locked_up_token,
+                    'down_token_id': self.locked_down_token,
+                    'start_time': datetime.now(et_tz),
+                    'end_time': self.market_end_time,
+                    'market': market
+                })
         
         # Periodic redeem (only on slow path)
         # await self._periodic_redeem()
@@ -389,9 +451,6 @@ class FastTradingBot:
         FAST PATH: Minimal latency price check and execution.
         Uses WebSocket for instant prices (no HTTP call).
         """
-        # === START PROFILING - Total cycle time ===
-        t0 = time.perf_counter()
-
         # Get prices - WebSocket (instant) or HTTP (fallback)
         if self.use_websocket:
             # INSTANT: Read from memory (no network call!)
@@ -415,26 +474,24 @@ class FastTradingBot:
         if up_price is None or down_price is None:
             return
 
-        # Record price snapshot (every 1 second)
-        self.data_collector.record_price(up_price, down_price)
+        # Record price snapshot (if data collector enabled)
+        if self._data_collector_enabled:
+            self.data_collector.record_price(up_price, down_price)
 
-        # Build price data for compatibility
-        price_data = {
-            'up_price': up_price,
-            'down_price': down_price,
-            'up_token_id': self.locked_up_token,
-            'down_token_id': self.locked_down_token,
-            'market': self.locked_market
-        }
-
-        # Orders already placed at market start - just collecting data
-        # No trigger logic needed - hold until market resolution
+        # Notify strategy of price update (if trading enabled)
+        if self.trading_enabled and self.strategy:
+            await self.strategy.on_price_update(
+                up_price=up_price,
+                down_price=down_price,
+                up_token_id=self.locked_up_token,
+                down_token_id=self.locked_down_token,
+                market=self.locked_market
+            )
     
     async def _scan_and_place_future_orders(self):
         """
-        Scan for new future markets and place orders immediately.
-        This ensures MAXIMUM FIFO priority by placing orders as soon as
-        markets are created (up to 24h before they become active).
+        Scan for new future markets and notify strategy.
+        Strategy decides whether/how to place orders.
         """
         now = time.time()
         
@@ -451,140 +508,16 @@ class FastTradingBot:
             if not future_markets:
                 return
             
-            # Find markets where we haven't placed orders yet
-            new_markets = []
+            # Notify strategy about each new market
             for market_data in future_markets:
                 condition_id = market_data['condition_id']
-                if condition_id and condition_id not in self.orders_placed_markets:
-                    new_markets.append(market_data)
-            
-            if new_markets:
-                logger.info(f"Found {len(new_markets)} NEW future markets without orders")
-                
-                # Place orders on each new market
-                for market_data in new_markets:
-                    await self._place_orders_on_market(market_data)
+                if condition_id and not self.strategy.is_market_processed(condition_id):
+                    await self.strategy.on_new_market(market_data)
                     # Small delay between markets to avoid rate limits
                     await asyncio.sleep(0.5)
                     
         except Exception as e:
             logger.error(f"Error scanning future markets: {e}")
-    
-    async def _place_orders_on_market(self, market_data: Dict):
-        """
-        Place both UP and DOWN limit orders on a market.
-        Called for both current and future markets.
-        """
-        condition_id = market_data['condition_id']
-        up_token = market_data['up_token_id']
-        down_token = market_data['down_token_id']
-        start_time = market_data['start_time']
-        market = market_data['market']
-        
-        # Format start time for logging
-        et_tz = pytz.timezone('America/New_York')
-        start_et = start_time.astimezone(et_tz)
-        time_until = start_time - datetime.now(pytz.UTC)
-        hours_until = time_until.total_seconds() / 3600
-        
-        logger.info(f"NEW MARKET DETECTED: {market_data['question'][:50]}...")
-        logger.info(f"  Starts: {start_et.strftime('%Y-%m-%d %H:%M')} ET ({hours_until:.1f}h from now)")
-        logger.info(f"  Placing orders @ ${self.entry_price:.3f}...")
-        
-        # Place UP order
-        up_order = self.trader.place_buy_order(
-            token_id=up_token,
-            side='up',
-            price=self.entry_price,
-            size=self.position_size,
-            market_info=market,
-            order_type="GTC"
-        )
-        
-        if up_order:
-            logger.info(f"  UP order placed - Size: {self.position_size}")
-        else:
-            logger.warning(f"  Failed to place UP order")
-        
-        # Place DOWN order
-        down_order = self.trader.place_buy_order(
-            token_id=down_token,
-            side='down',
-            price=self.entry_price,
-            size=self.position_size,
-            market_info=market,
-            order_type="GTC"
-        )
-        
-        if down_order:
-            logger.info(f"  DOWN order placed - Size: {self.position_size}")
-        else:
-            logger.warning(f"  Failed to place DOWN order")
-        
-        # Mark market as processed (even if orders failed, to avoid retry spam)
-        self.orders_placed_markets.add(condition_id)
-        
-        if up_order and down_order:
-            logger.info(f"  Both orders queued - MAXIMUM PRIORITY secured!")
-        
-        # Log total markets with orders
-        logger.info(f"  Total markets with orders: {len(self.orders_placed_markets)}")
-    
-    async def _recover_orders_state(self):
-        """
-        Recover state from Polymarket on startup.
-        Checks which markets already have open orders to avoid duplicates.
-        
-        This survives app restarts by querying the actual orderbook state.
-        """
-        logger.info("Recovering orders state from Polymarket...")
-        
-        try:
-            # Get token IDs with open orders
-            open_token_ids = self.trader.get_open_order_token_ids()
-            
-            if not open_token_ids:
-                logger.info("No existing open orders found - starting fresh")
-                return
-            
-            logger.info(f"Found {len(open_token_ids)} tokens with open orders")
-            
-            # Scan future markets to map token_ids -> condition_ids
-            future_markets = await self.monitor.get_future_markets(self.future_scan_hours)
-            
-            # Also get current active markets
-            current_markets = await self.monitor.get_all_market_prices()
-            
-            # Build token -> condition_id mapping
-            token_to_condition = {}
-            
-            for market_data in future_markets:
-                condition_id = market_data['condition_id']
-                token_to_condition[market_data['up_token_id']] = condition_id
-                token_to_condition[market_data['down_token_id']] = condition_id
-            
-            for price_data in current_markets:
-                condition_id = price_data['market'].get('conditionId')
-                if condition_id:
-                    token_to_condition[price_data['up_token_id']] = condition_id
-                    token_to_condition[price_data['down_token_id']] = condition_id
-            
-            # Find condition_ids for our open orders
-            recovered_markets = set()
-            for token_id in open_token_ids:
-                condition_id = token_to_condition.get(token_id)
-                if condition_id:
-                    recovered_markets.add(condition_id)
-            
-            # Add to our tracking set
-            self.orders_placed_markets.update(recovered_markets)
-            
-            logger.info(f"Recovered {len(recovered_markets)} markets with existing orders")
-            logger.info(f"Total markets tracked: {len(self.orders_placed_markets)}")
-            
-        except Exception as e:
-            logger.error(f"Error recovering orders state: {e}")
-            logger.info("Continuing with empty state - may place duplicate orders")
     
     async def _periodic_redeem(self):
         """Periodically check for redeemable positions"""
@@ -602,6 +535,10 @@ class FastTradingBot:
     async def shutdown(self):
         """Clean up resources"""
         logger.info("Shutting down...")
+        
+        # Shutdown strategy
+        if self.strategy:
+            await self.strategy.shutdown()
         
         # Save any pending market data
         if self.data_collector.has_active_market():
@@ -634,7 +571,8 @@ async def main():
         market=args.market,
         mode=args.mode,
         position_size=args.size,
-        entry_price=args.price
+        entry_price=args.price,
+        strategy_name=args.strategy
     )
     
     # Handle shutdown signals
