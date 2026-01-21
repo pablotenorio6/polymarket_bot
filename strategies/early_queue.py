@@ -13,6 +13,7 @@ Rationale:
 Configuration:
 - entry_price: Price for limit orders (default: 0.01 = lowest possible)
 - position_size: USD amount per order
+- cancel_before_end_seconds: Cancel unfilled orders N seconds before market end (default: 10)
 """
 
 import logging
@@ -32,16 +33,23 @@ class EarlyQueueStrategy(BaseStrategy):
     Lifecycle:
     1. initialize(): Recover existing orders from Polymarket API
     2. on_new_market(): Place UP + DOWN orders immediately
-    3. on_price_update(): Just record data (orders already placed)
+    3. on_price_update(): Monitor time and cancel unfilled orders before market end
     4. on_market_end(): Orders resolve automatically
     """
     
     name = "early_queue"
     description = "Place GTC orders at market creation for FIFO priority"
     
+    # Configuration: seconds before market end to cancel unfilled orders
+    cancel_before_end_seconds = 10
+    
     async def initialize(self) -> None:
         """Recover state from open orders on Polymarket"""
         logger.info("Recovering orders state from Polymarket...")
+        
+        # Track active markets with their end times and token IDs
+        # condition_id -> {end_time, up_token_id, down_token_id, orders_cancelled}
+        self.active_market_info: Dict[str, Dict] = {}
         
         try:
             # Get token IDs with open orders
@@ -157,6 +165,14 @@ class EarlyQueueStrategy(BaseStrategy):
         if up_order and down_order:
             logger.info(f"  Both orders queued - MAXIMUM PRIORITY secured!")
         
+        # Track this market for cancellation monitoring
+        self.active_market_info[condition_id] = {
+            'end_time': market_data['end_time'],
+            'up_token_id': up_token,
+            'down_token_id': down_token,
+            'orders_cancelled': False
+        }
+        
         # Log total markets with orders
         logger.info(f"  Total markets with orders: {len(self.processed_markets)}")
     
@@ -171,12 +187,91 @@ class EarlyQueueStrategy(BaseStrategy):
         """
         Called on each price update.
         
-        For early_queue strategy, we just record data.
-        Orders are already placed and will resolve automatically.
+        For early_queue strategy:
+        - Monitor time remaining until market end
+        - Cancel unfilled limit orders if less than N seconds remain
         """
-        # Data recording is handled by the bot
-        # No action needed - orders are already in queue
-        pass
+        # Find the active market by token IDs
+        condition_id = market.get('conditionId')
+        
+        if not condition_id or condition_id not in self.active_market_info:
+            return
+        
+        market_info = self.active_market_info[condition_id]
+        
+        # Skip if we already cancelled orders for this market
+        if market_info.get('orders_cancelled', False):
+            return
+        
+        # Check time remaining until market end
+        end_time = market_info['end_time']
+        now = datetime.now(pytz.UTC)
+        time_remaining = (end_time - now).total_seconds()
+        
+        # Cancel unfilled orders if less than N seconds remain
+        if time_remaining <= self.cancel_before_end_seconds and time_remaining > 0:
+            logger.info(f"[EarlyQueue] {time_remaining:.1f}s until market end - cancelling unfilled orders...")
+            
+            cancelled = self._cancel_unfilled_orders(up_token_id, down_token_id)
+            
+            if cancelled:
+                logger.info(f"[EarlyQueue] Successfully cancelled {cancelled} unfilled order(s)")
+            else:
+                logger.info(f"[EarlyQueue] No unfilled orders to cancel (may have been filled)")
+            
+            # Mark as cancelled so we don't try again
+            market_info['orders_cancelled'] = True
+    
+    def _cancel_unfilled_orders(self, up_token_id: str, down_token_id: str) -> int:
+        """
+        Cancel any unfilled (LIVE) orders for the given tokens.
+        
+        Returns:
+            Number of orders cancelled
+        """
+        if not self.trader or not self.trader.client:
+            logger.warning("[EarlyQueue] Trader not available for cancellation")
+            return 0
+        
+        cancelled_count = 0
+        
+        try:
+            # Get all open orders
+            open_orders = self.trader.get_open_orders()
+            
+            # Filter orders for our tokens
+            orders_to_cancel = []
+            for order in open_orders:
+                token_id = order.get('token_id')
+                if token_id in (up_token_id, down_token_id):
+                    order_id = order.get('order_id')
+                    if order_id:
+                        orders_to_cancel.append(order_id)
+            
+            if not orders_to_cancel:
+                return 0
+            
+            # Cancel the orders
+            logger.info(f"[EarlyQueue] Cancelling {len(orders_to_cancel)} order(s)...")
+            
+            if len(orders_to_cancel) == 1:
+                result = self.trader.client.cancel(orders_to_cancel[0])
+            else:
+                result = self.trader.client.cancel_orders(orders_to_cancel)
+            
+            if result:
+                cancelled = result.get('canceled', [])
+                not_cancelled = result.get('not_canceled', {})
+                
+                cancelled_count = len(cancelled)
+                
+                if not_cancelled:
+                    logger.warning(f"[EarlyQueue] Some orders not cancelled: {not_cancelled}")
+            
+        except Exception as e:
+            logger.error(f"[EarlyQueue] Error cancelling orders: {e}")
+        
+        return cancelled_count
     
     async def on_market_end(self, market_data: Dict, winner: Optional[str]) -> None:
         """
@@ -185,10 +280,14 @@ class EarlyQueueStrategy(BaseStrategy):
         For early_queue, positions resolve automatically.
         We could log the outcome here for analysis.
         """
-        condition_id = market_data.get('condition_id', 'unknown')[:10]
+        condition_id = market_data.get('condition_id', 'unknown')
         question = market_data.get('question', 'Unknown')[:40]
         
         if winner:
             logger.info(f"Market ended: {question}... Winner: {winner}")
         else:
             logger.info(f"Market ended: {question}... (winner unknown)")
+        
+        # Clean up active market tracking
+        if condition_id in self.active_market_info:
+            del self.active_market_info[condition_id]
