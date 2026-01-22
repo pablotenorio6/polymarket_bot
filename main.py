@@ -126,6 +126,7 @@ from redeem import RedeemManager
 from ws_monitor import HybridPriceMonitor
 from data_collector import DataCollector
 from rtds_crypto_prices import RTDSCryptoPrices
+from cash_balance import get_available_cash_usdc_from_clob_client
 
 
 class FastTradingBot:
@@ -344,6 +345,41 @@ class FastTradingBot:
                 return True
         
         return False
+
+    def _get_available_cash_usdc(self) -> Optional[float]:
+        """
+        Return *available* collateral (USDC cash) for the trading account.
+
+        Important: This is NOT portfolio value. It comes from the CLOB L2 balance
+        endpoint (COLLATERAL balance).
+        """
+        client = getattr(self.trader, "client", None) if self.trader else None
+        return get_available_cash_usdc_from_clob_client(client)
+
+    async def _redeem_if_low_cash_after_market_end(self, threshold_usd: float = 100.0) -> None:
+        """
+        At market end: if available cash is below threshold, run `redeem.py`.
+        Runs redeem in a background thread to avoid blocking the asyncio loop.
+        """
+        cash = self._get_available_cash_usdc()
+        if cash is None:
+            return
+
+        if cash >= threshold_usd:
+            return
+
+        logger.info(f"Low cash balance: ${cash:.2f} < ${threshold_usd:.2f} -> running redeem")
+        try:
+            results = await asyncio.to_thread(self.redeem_manager.run_redeem)
+            # Keep this log compact; redeem.py already logs details.
+            if isinstance(results, dict):
+                logger.info(
+                    f"Redeem finished: success={results.get('success')} "
+                    f"redeemed={results.get('positions_redeemed')} "
+                    f"found={results.get('positions_found')}"
+                )
+        except Exception as e:
+            logger.warning(f"Redeem failed: {e}")
     
     async def _refresh_market(self):
         """SLOW PATH: Find new market and set up (runs every ~15 min)"""
@@ -373,6 +409,9 @@ class FastTradingBot:
             # Save data if collector is enabled
             if self._data_collector_enabled and self.data_collector.has_active_market():
                 await self.data_collector.save_market(winner=winner)
+
+            # If market ended, check cash and redeem if needed
+            await self._redeem_if_low_cash_after_market_end(threshold_usd=100.0)
             self._market_expired = False
         
         # Clear locked state
