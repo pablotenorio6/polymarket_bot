@@ -1,12 +1,18 @@
 """
 Whale Copy Strategy - Copy trades from suspected market manipulators
 
-This strategy monitors a target wallet for large buys in 15-minute crypto markets
+This strategy monitors target wallet(s) for large buys in 15-minute crypto markets
 and copies their position when detected.
 
 Theory: Certain whales may manipulate the underlying crypto price to win
 these short-term prediction markets. By copying their positions early,
 we can profit from their manipulation.
+
+Configuration:
+    - Set WHALE_TARGET_WALLETS env var to configure which wallets to monitor
+    - Use comma-separated addresses for multiple whales:
+      WHALE_TARGET_WALLETS=0x123...,0x456...,0x789...
+    - If not set, uses default wallets defined in the strategy
 
 Usage: python main.py --market btc --mode trade --strategy whale_copy
 """
@@ -14,6 +20,7 @@ Usage: python main.py --market btc --mode trade --strategy whale_copy
 import logging
 import asyncio
 import httpx
+import os
 from typing import Dict, Optional, List
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -60,8 +67,13 @@ class WhaleCopyStrategy(BaseStrategy):
     
     # ===== CONFIGURATION =====
     
-    # Target wallet to monitor (a4385, other is hai15617)
-    DEFAULT_TARGET_WALLET = "0x506bce138df20695c03cd5a59a937499fb00b0fe"
+    # Target wallets to monitor - can be set via WHALE_TARGET_WALLETS env var
+    # Use comma-separated addresses for multiple whales
+    # Example: WHALE_TARGET_WALLETS=0x123...,0x456...,0x789...
+    DEFAULT_TARGET_WALLETS = [
+        "0x506bce138df20695c03cd5a59a937499fb00b0fe",  # a4385
+        "0xa5e83423126dbc6cdb34f10f37f5d27668ab95f5",  # hai15617
+    ]
     
     # Crypto market identifiers (slugs containing these are crypto markets)
     CRYPTO_SLUGS = ['btc', 'eth', 'sol', 'xrp', 'bitcoin', 'ethereum', 'solana']
@@ -79,8 +91,16 @@ class WhaleCopyStrategy(BaseStrategy):
         """Initialize strategy state"""
         logger.info(f"Initializing {self.name} strategy...")
         
-        # Target wallet(s) to monitor
-        self.target_wallets = [self.DEFAULT_TARGET_WALLET]
+        # Target wallet(s) to monitor - from env var or defaults
+        # Env var format: WHALE_TARGET_WALLETS=0x123...,0x456...
+        env_wallets = os.environ.get('WHALE_TARGET_WALLETS', '')
+        if env_wallets:
+            # Parse comma-separated wallets, strip whitespace
+            self.target_wallets = [w.strip() for w in env_wallets.split(',') if w.strip()]
+            logger.info(f"  Using wallets from WHALE_TARGET_WALLETS env var")
+        else:
+            self.target_wallets = self.DEFAULT_TARGET_WALLETS.copy()
+            logger.info(f"  Using default target wallets")
         
         # Track our position in current market
         # Once we copy, we can only SELL (not buy again)
@@ -107,7 +127,9 @@ class WhaleCopyStrategy(BaseStrategy):
         # Background task for monitoring
         self._monitor_task: Optional[asyncio.Task] = None
         
-        logger.info(f"  Monitoring wallet: {self.DEFAULT_TARGET_WALLET}")
+        logger.info(f"  Monitoring {len(self.target_wallets)} whale(s):")
+        for i, wallet in enumerate(self.target_wallets, 1):
+            logger.info(f"    {i}. {wallet}")
         logger.info(f"  Min whale buy: ${self.MIN_WHALE_BUY}")
         logger.info(f"  Copy size: ${self.COPY_SIZE}")
         
@@ -291,22 +313,25 @@ class WhaleCopyStrategy(BaseStrategy):
     
     async def _get_whale_positions(self) -> List[Dict]:
         """
-        Fetch whale's current positions using /positions endpoint.
+        Fetch positions from ALL monitored whales using /positions endpoint.
         
-        Returns list of ACTIVE crypto positions (curPrice > 0).
+        Returns list of ACTIVE crypto positions (curPrice > 0) from all wallets.
+        Each position includes 'wallet' field to identify which whale it belongs to.
         """
+        all_active_crypto = []
+        
         try:
             for wallet in self.target_wallets:
                 url = f"https://data-api.polymarket.com/positions?user={wallet}"
                 response = await self.http_client.get(url)
                 
                 if response.status_code != 200:
+                    logger.debug(f"Failed to fetch positions for {wallet[:10]}...")
                     continue
                 
                 all_positions = response.json()
                 
                 # Filter to active crypto positions only
-                active_crypto = []
                 for pos in all_positions:
                     slug = pos.get('slug', '')
                     cur_price = float(pos.get('curPrice', 0))
@@ -314,62 +339,70 @@ class WhaleCopyStrategy(BaseStrategy):
                     
                     # Only active positions (price > 0) in crypto markets
                     if cur_price > 0 and size > 0 and self._is_crypto_market(slug):
-                        active_crypto.append(pos)
-                
-                return active_crypto
+                        # Add wallet identifier to position
+                        pos['wallet'] = wallet
+                        all_active_crypto.append(pos)
             
-            return []
+            return all_active_crypto
             
         except Exception as e:
             logger.error(f"Error fetching whale positions: {e}")
-            return []
+            return all_active_crypto
     
     async def _log_whale_positions(self, positions: List[Dict], active_positions: List[Dict] = None) -> None:
-        """Log whale's positions in ACTIVE markets only"""
+        """Log whale positions in ACTIVE markets only, grouped by wallet"""
         active_positions = active_positions or []
         
         if not active_positions:
-            logger.info("Whale has no positions in active markets")
+            logger.info(f"No whale positions in active markets ({len(self.target_wallets)} wallets monitored)")
             return
         
         logger.info("=" * 70)
-        logger.info(f"WHALE ACTIVE POSITIONS ({len(active_positions)} in active markets)")
+        logger.info(f"WHALE ACTIVE POSITIONS ({len(active_positions)} positions from {len(self.target_wallets)} wallets)")
         logger.info("=" * 70)
         
-        # Group by crypto
-        by_crypto = {}
+        # Group by wallet, then by crypto
+        by_wallet = {}
         for pos in active_positions:
+            wallet = pos.get('wallet', 'unknown')
+            wallet_short = f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 10 else wallet
+            if wallet_short not in by_wallet:
+                by_wallet[wallet_short] = {}
+            
             slug = pos.get('slug', '')
             for crypto in self.CRYPTO_SLUGS:
                 if crypto in slug.lower():
-                    if crypto not in by_crypto:
-                        by_crypto[crypto] = []
-                    by_crypto[crypto].append(pos)
+                    if crypto not in by_wallet[wallet_short]:
+                        by_wallet[wallet_short][crypto] = []
+                    by_wallet[wallet_short][crypto].append(pos)
                     break
         
         total_value = 0
-        for crypto, crypto_positions in sorted(by_crypto.items()):
-            logger.info(f"\n{crypto.upper()}:")
-            for pos in crypto_positions:
-                title = pos.get('title', '')[:50]
-                outcome = pos.get('outcome', '')
-                size = float(pos.get('size', 0))
-                cur_price = float(pos.get('curPrice', 0))
-                current_value = float(pos.get('currentValue', 0))
-                total_bought = float(pos.get('totalBought', 0))
-                
-                total_value += current_value
-                
-                logger.info(
-                    f"  {outcome:5} | Size: {size:>10.2f} | "
-                    f"Price: {cur_price:.2f} | "
-                    f"Value: ${current_value:>8.2f} | "
-                    f"Bought: ${total_bought:>10.2f}"
-                )
-                logger.info(f"         {title}")
+        for wallet_short, by_crypto in sorted(by_wallet.items()):
+            logger.info(f"\n[{wallet_short}]")
+            
+            for crypto, crypto_positions in sorted(by_crypto.items()):
+                logger.info(f"  {crypto.upper()}:")
+                for pos in crypto_positions:
+                    title = pos.get('title', '')[:45]
+                    outcome = pos.get('outcome', '')
+                    size = float(pos.get('size', 0))
+                    cur_price = float(pos.get('curPrice', 0))
+                    current_value = float(pos.get('currentValue', 0))
+                    total_bought = float(pos.get('totalBought', 0))
+                    
+                    total_value += current_value
+                    
+                    logger.info(
+                        f"    {outcome:5} | Size: {size:>10.2f} | "
+                        f"Price: {cur_price:.2f} | "
+                        f"Value: ${current_value:>8.2f} | "
+                        f"Bought: ${total_bought:>10.2f}"
+                    )
+                    logger.info(f"           {title}")
         
         logger.info("-" * 70)
-        logger.info(f"TOTAL ACTIVE VALUE: ${total_value:,.2f}")
+        logger.info(f"TOTAL ACTIVE VALUE (all whales): ${total_value:,.2f}")
         
         # Show our position if any
         if self.copied_side:
@@ -414,6 +447,8 @@ class WhaleCopyStrategy(BaseStrategy):
         total_bought = float(best_pos.get('totalBought', 0))
         title = best_pos.get('title', '')
         cur_price = float(best_pos.get('curPrice', 0))
+        wallet = best_pos.get('wallet', 'unknown')
+        wallet_short = f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 10 else wallet
         
         side = outcome.lower()  # 'up' or 'down'
         
@@ -422,6 +457,7 @@ class WhaleCopyStrategy(BaseStrategy):
         
         logger.info("=" * 60)
         logger.info(f">>> WHALE DETECTED - COPYING!")
+        logger.info(f"  Whale: {wallet_short}")
         logger.info(f"  Market: {title}")
         logger.info(f"  Direction: {outcome}")
         logger.info(f"  Whale invested: ${total_bought:,.0f}")
@@ -516,12 +552,16 @@ class WhaleCopyStrategy(BaseStrategy):
     
     async def _get_whale_activity(self) -> tuple[Optional[WhaleActivity], List[str]]:
         """
-        Fetch and analyze recent whale activity in ANY crypto market.
+        Fetch and analyze recent activity from ALL monitored whales in crypto markets.
         
+        Aggregates activity from all wallets.
         Returns (WhaleActivity, list of market slugs with activity).
         """
+        # Aggregate activity from all wallets
+        market_activity = {}
+        now = datetime.now(pytz.UTC)
+        
         try:
-            # Fetch recent activity for target wallet
             for wallet in self.target_wallets:
                 url = f"https://data-api.polymarket.com/activity?user={wallet}&limit=100"
                 response = await self.http_client.get(url)
@@ -530,10 +570,6 @@ class WhaleCopyStrategy(BaseStrategy):
                     continue
                 
                 activities = response.json()
-                now = datetime.now(pytz.UTC)
-                
-                # Group activity by market slug (any crypto market)
-                market_activity = {}
                 
                 for act in activities:
                     slug = act.get('slug', '')
@@ -575,55 +611,22 @@ class WhaleCopyStrategy(BaseStrategy):
                         else:
                             m['down_sells'] += usdc
                         m['trade_count'] += 1
-                
-                # List of markets with activity (for logging)
-                active_markets = list(market_activity.keys())
-                
-                # Find the most significant BUY activity (prioritize new positions)
-                best_activity = None
-                best_buy_volume = 0
-                
-                for slug, m in market_activity.items():
-                    # Check UP buys
-                    if m['up_buys'] >= self.MIN_WHALE_BUY:
-                        if m['up_buys'] > best_buy_volume:
-                            best_buy_volume = m['up_buys']
-                            best_activity = WhaleActivity(
-                                timestamp=now,
-                                market_slug=slug,
-                                side='up',
-                                outcome='Up',
-                                total_buys=m['up_buys'],
-                                total_sells=m['up_sells'],
-                                token_id=m['up_token'],
-                                num_trades=m['trade_count'],
-                                is_accumulating=m['up_buys'] > m['up_sells']
-                            )
-                    
-                    # Check DOWN buys
-                    if m['down_buys'] >= self.MIN_WHALE_BUY:
-                        if m['down_buys'] > best_buy_volume:
-                            best_buy_volume = m['down_buys']
-                            best_activity = WhaleActivity(
-                                timestamp=now,
-                                market_slug=slug,
-                                side='down',
-                                outcome='Down',
-                                total_buys=m['down_buys'],
-                                total_sells=m['down_sells'],
-                                token_id=m['down_token'],
-                                num_trades=m['trade_count'],
-                                is_accumulating=m['down_buys'] > m['down_sells']
-                            )
-                
-                # If we have a position, also check for sell signals in that market
-                if self.copied_market_slug and self.copied_market_slug in market_activity:
-                    m = market_activity[self.copied_market_slug]
-                    if self.copied_side == 'up' and m['up_sells'] > 0:
-                        # Whale is selling in our copied market
+            
+            # List of markets with activity (for logging)
+            active_markets = list(market_activity.keys())
+            
+            # Find the most significant BUY activity (prioritize new positions)
+            best_activity = None
+            best_buy_volume = 0
+            
+            for slug, m in market_activity.items():
+                # Check UP buys
+                if m['up_buys'] >= self.MIN_WHALE_BUY:
+                    if m['up_buys'] > best_buy_volume:
+                        best_buy_volume = m['up_buys']
                         best_activity = WhaleActivity(
                             timestamp=now,
-                            market_slug=self.copied_market_slug,
+                            market_slug=slug,
                             side='up',
                             outcome='Up',
                             total_buys=m['up_buys'],
@@ -632,10 +635,14 @@ class WhaleCopyStrategy(BaseStrategy):
                             num_trades=m['trade_count'],
                             is_accumulating=m['up_buys'] > m['up_sells']
                         )
-                    elif self.copied_side == 'down' and m['down_sells'] > 0:
+                
+                # Check DOWN buys
+                if m['down_buys'] >= self.MIN_WHALE_BUY:
+                    if m['down_buys'] > best_buy_volume:
+                        best_buy_volume = m['down_buys']
                         best_activity = WhaleActivity(
                             timestamp=now,
-                            market_slug=self.copied_market_slug,
+                            market_slug=slug,
                             side='down',
                             outcome='Down',
                             total_buys=m['down_buys'],
@@ -644,10 +651,37 @@ class WhaleCopyStrategy(BaseStrategy):
                             num_trades=m['trade_count'],
                             is_accumulating=m['down_buys'] > m['down_sells']
                         )
-                
-                return best_activity, active_markets
             
-            return None, []
+            # If we have a position, also check for sell signals in that market
+            if self.copied_market_slug and self.copied_market_slug in market_activity:
+                m = market_activity[self.copied_market_slug]
+                if self.copied_side == 'up' and m['up_sells'] > 0:
+                    # Whale is selling in our copied market
+                    best_activity = WhaleActivity(
+                        timestamp=now,
+                        market_slug=self.copied_market_slug,
+                        side='up',
+                        outcome='Up',
+                        total_buys=m['up_buys'],
+                        total_sells=m['up_sells'],
+                        token_id=m['up_token'],
+                        num_trades=m['trade_count'],
+                        is_accumulating=m['up_buys'] > m['up_sells']
+                    )
+                elif self.copied_side == 'down' and m['down_sells'] > 0:
+                    best_activity = WhaleActivity(
+                        timestamp=now,
+                        market_slug=self.copied_market_slug,
+                        side='down',
+                        outcome='Down',
+                        total_buys=m['down_buys'],
+                        total_sells=m['down_sells'],
+                        token_id=m['down_token'],
+                        num_trades=m['trade_count'],
+                        is_accumulating=m['down_buys'] > m['down_sells']
+                    )
+            
+            return best_activity, active_markets
             
         except Exception as e:
             logger.error(f"Error fetching whale activity: {e}")
