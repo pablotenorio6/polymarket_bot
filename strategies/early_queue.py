@@ -67,31 +67,56 @@ class EarlyQueueStrategy(BaseStrategy):
             # Also get current active markets
             current_markets = await self.monitor.get_all_market_prices()
             
-            # Build token -> condition_id mapping
+            # Build token -> condition_id mapping AND store market info
             token_to_condition = {}
+            market_info_map = {}  # condition_id -> {end_time, up_token_id, down_token_id}
             
             for market_data in future_markets:
                 condition_id = market_data['condition_id']
                 token_to_condition[market_data['up_token_id']] = condition_id
                 token_to_condition[market_data['down_token_id']] = condition_id
+                market_info_map[condition_id] = {
+                    'end_time': market_data['end_time'],
+                    'up_token_id': market_data['up_token_id'],
+                    'down_token_id': market_data['down_token_id']
+                }
             
             for price_data in current_markets:
                 condition_id = price_data['market'].get('conditionId')
                 if condition_id:
                     token_to_condition[price_data['up_token_id']] = condition_id
                     token_to_condition[price_data['down_token_id']] = condition_id
+                    # Get end_time from market data if available
+                    end_date = price_data['market'].get('endDate')
+                    if end_date and condition_id not in market_info_map:
+                        from dateutil import parser
+                        end_time = parser.parse(end_date)
+                        market_info_map[condition_id] = {
+                            'end_time': end_time,
+                            'up_token_id': price_data['up_token_id'],
+                            'down_token_id': price_data['down_token_id']
+                        }
             
-            # Find condition_ids for our open orders
+            # Find condition_ids for our open orders and reconstruct active_market_info
             recovered_markets = set()
             for token_id in open_token_ids:
                 condition_id = token_to_condition.get(token_id)
                 if condition_id:
                     recovered_markets.add(condition_id)
+                    # Reconstruct active_market_info for cancellation monitoring
+                    if condition_id in market_info_map and condition_id not in self.active_market_info:
+                        self.active_market_info[condition_id] = {
+                            'end_time': market_info_map[condition_id]['end_time'],
+                            'up_token_id': market_info_map[condition_id]['up_token_id'],
+                            'down_token_id': market_info_map[condition_id]['down_token_id'],
+                            'orders_cancelled': False
+                        }
             
             # Add to our tracking set
             self.processed_markets.update(recovered_markets)
             
             logger.info(f"Recovered {len(recovered_markets)} markets with existing orders")
+            logger.info(f"Reconstructed {len(self.active_market_info)} markets for cancellation monitoring")
             logger.info(f"Total markets tracked: {len(self.processed_markets)}")
             
         except Exception as e:
