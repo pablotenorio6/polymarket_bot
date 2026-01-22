@@ -77,7 +77,6 @@ class WhaleCopyStrategy(BaseStrategy):
     
     # Crypto market identifiers (slugs containing these are crypto markets)
     CRYPTO_SLUGS = ['btc', 'eth', 'sol', 'xrp', 'bitcoin', 'ethereum', 'solana']
-    
     # Detection thresholds
     MIN_WHALE_BUY = 500          # Minimum $ to consider a "whale buy"
     
@@ -85,41 +84,30 @@ class WhaleCopyStrategy(BaseStrategy):
     COPY_SIZE = 50               # Fixed $ amount to copy per detection
     
     # Timing
-    POLL_INTERVAL = 3            # Check whale activity every N seconds
+    POLL_INTERVAL = 2            # Check whale activity every N seconds
     
     async def initialize(self) -> None:
         """Initialize strategy state"""
         logger.info(f"Initializing {self.name} strategy...")
         
         # Target wallet(s) to monitor - from env var or defaults
-        # Env var format: WHALE_TARGET_WALLETS=0x123...,0x456...
         env_wallets = os.environ.get('WHALE_TARGET_WALLETS', '')
         if env_wallets:
-            # Parse comma-separated wallets, strip whitespace
             self.target_wallets = [w.strip() for w in env_wallets.split(',') if w.strip()]
-            logger.info(f"  Using wallets from WHALE_TARGET_WALLETS env var")
         else:
             self.target_wallets = self.DEFAULT_TARGET_WALLETS.copy()
-            logger.info(f"  Using default target wallets")
         
-        # Track our position in current market
-        # Once we copy, we can only SELL (not buy again)
-        self.copied_side: Optional[str] = None      # 'up' or 'down' or None
-        self.copied_size: float = 0.0               # $ amount we copied
-        self.copied_token_id: Optional[str] = None
-        self.copied_market_slug: Optional[str] = None  # slug of market we copied in
+        # Track our positions in MULTIPLE markets simultaneously
+        # Dict keyed by market slug: {slug: {side, size, token_id, up_token_id, down_token_id, condition_id}}
+        self.positions: Dict[str, Dict] = {}
         
-        # Track attempted copies to avoid spam
-        self.attempted_markets: set = set()  # slugs we've already tried to copy
+        # Track logged positions to avoid duplicate "new position detected" logs
+        self.logged_positions: set = set()  # (slug, direction) tuples we've already logged
         
-        # Track whale's last known position for comparison
-        self.whale_last_buys: float = 0.0
-        
-        # Current market info
-        self.current_market_slug: Optional[str] = None
-        self.current_up_token: Optional[str] = None
-        self.current_down_token: Optional[str] = None
-        self.market_end_time: Optional[datetime] = None
+        # Cooldown after selling to prevent buy/sell loops
+        # Dict: slug -> datetime of last sell
+        self.sell_cooldowns: Dict[str, datetime] = {}
+        self.SELL_COOLDOWN_SECONDS = 10  # Wait 60s after selling before buying same market again
         
         # HTTP client for API calls
         self.http_client = httpx.AsyncClient(timeout=10.0)
@@ -127,11 +115,7 @@ class WhaleCopyStrategy(BaseStrategy):
         # Background task for monitoring
         self._monitor_task: Optional[asyncio.Task] = None
         
-        logger.info(f"  Monitoring {len(self.target_wallets)} whale(s):")
-        for i, wallet in enumerate(self.target_wallets, 1):
-            logger.info(f"    {i}. {wallet}")
-        logger.info(f"  Min whale buy: ${self.MIN_WHALE_BUY}")
-        logger.info(f"  Copy size: ${self.COPY_SIZE}")
+        logger.info(f"Whale copy: {len(self.target_wallets)} wallet(s), min ${self.MIN_WHALE_BUY}, copy ${self.COPY_SIZE}")
         
         # Start whale monitor immediately - it will find active markets on its own
         self._monitor_task = asyncio.create_task(self._whale_monitor_loop())
@@ -157,12 +141,7 @@ class WhaleCopyStrategy(BaseStrategy):
     
     async def _whale_monitor_loop(self) -> None:
         """Background loop to monitor whale positions in ANY crypto market"""
-        logger.info("Starting whale monitor loop...")
-        logger.info(f"  Monitoring ALL crypto markets (BTC, ETH, SOL, XRP - any timeframe)")
-        logger.info(f"  Using /positions endpoint for real-time position tracking")
-        
-        # Counter for periodic status log
-        poll_count = 0
+        logger.info("Whale monitor started")
         
         while True:
             try:
@@ -178,41 +157,93 @@ class WhaleCopyStrategy(BaseStrategy):
                     if self._is_market_active_now(title, end_date):
                         active_positions.append(pos)
                 
-                # Log positions every ~30 seconds (10 polls at 3s interval)
-                poll_count += 1
-                if poll_count % 10 == 1 or poll_count == 1:
-                    await self._log_whale_positions(positions, active_positions)
+                # Log NEW whale positions (once per position)
+                self._log_new_positions(active_positions)
                 
                 # === COPY LOGIC ===
-                # Only if we haven't copied yet
-                if self.copied_side is None and active_positions:
-                    await self._try_copy_whale_position(active_positions)
+                # Try to copy ALL markets that meet threshold (multiple markets supported)
+                if active_positions:
+                    await self._try_copy_whale_positions(active_positions)
                 
-                # If we have a position, check if market is still active
-                if self.copied_side is not None:
-                    await self._check_position_exit(positions)
+                # Check exit conditions for ALL our positions
+                if self.positions:
+                    await self._check_all_positions_exit(positions)
                 
                 await asyncio.sleep(self.POLL_INTERVAL)
                 
             except asyncio.CancelledError:
-                logger.info("Whale monitor cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error in whale monitor: {e}")
+                logger.error(f"Whale monitor error: {e}")
                 await asyncio.sleep(self.POLL_INTERVAL)
     
-    def _reset_position(self) -> None:
-        """Reset position tracking for next market opportunity"""
-        self.copied_side = None
-        self.copied_size = 0.0
-        self.copied_token_id = None
-        self.copied_market_slug = None
-        self.whale_last_buys = 0.0
+    def _reset_position(self, slug: str) -> None:
+        """Reset position tracking for a specific market"""
+        if slug in self.positions:
+            del self.positions[slug]
+            logger.debug(f"Position reset for {slug}")
     
     def _is_crypto_market(self, slug: str) -> bool:
         """Check if slug is a crypto market (BTC, ETH, SOL, XRP)"""
         slug_lower = slug.lower()
         return any(crypto in slug_lower for crypto in self.CRYPTO_SLUGS)
+    
+    def _calculate_net_exposures(self, positions: List[Dict]) -> Dict[str, Dict]:
+        """
+        Calculate NET exposure per market by grouping UP and DOWN positions.
+        
+        For each market, calculates:
+        - up_value: total value in UP positions
+        - down_value: total value in DOWN positions  
+        - net_value: SIGNED value (up - down). Positive = UP, Negative = DOWN
+        - up_token_id, down_token_id: token IDs for each side
+        - representative_pos: a position dict to get metadata (title, etc)
+        
+        Returns dict keyed by market slug.
+        """
+        market_exposures = {}
+        
+        for pos in positions:
+            slug = pos.get('slug', '')
+            outcome = pos.get('outcome', '').lower()  # 'up' or 'down'
+            current_value = float(pos.get('currentValue', 0))
+            total_bought = float(pos.get('totalBought', 0))
+            token_id = pos.get('asset', '')
+            
+            if slug not in market_exposures:
+                market_exposures[slug] = {
+                    'up_value': 0.0,
+                    'down_value': 0.0,
+                    'up_bought': 0.0,
+                    'down_bought': 0.0,
+                    'up_token_id': None,
+                    'down_token_id': None,
+                    'up_price': 0.0,
+                    'down_price': 0.0,
+                    'representative_pos': pos,
+                    'condition_id': pos.get('conditionId', ''),
+                }
+            
+            m = market_exposures[slug]
+            
+            if outcome == 'up':
+                m['up_value'] += current_value
+                m['up_bought'] += total_bought
+                m['up_token_id'] = token_id
+                m['up_price'] = float(pos.get('curPrice', 0))
+            elif outcome == 'down':
+                m['down_value'] += current_value
+                m['down_bought'] += total_bought
+                m['down_token_id'] = token_id
+                m['down_price'] = float(pos.get('curPrice', 0))
+        
+        # Calculate SIGNED net exposure for each market
+        # Positive = UP conviction, Negative = DOWN conviction
+        for slug, m in market_exposures.items():
+            m['net_value'] = m['up_value'] - m['down_value']  # SIGNED, not abs()
+            m['slug'] = slug
+        
+        return market_exposures
     
     def _is_market_active_now(self, title: str, end_date: str) -> bool:
         """
@@ -235,66 +266,92 @@ class WhaleCopyStrategy(BaseStrategy):
             now_et = datetime.now(et_tz)
             
             # Parse end_date for the market date
-            market_date = datetime.strptime(end_date, "%Y-%m-%d").date()
-            
-            # Extract time range from title using regex
-            # Patterns like "3:15-3:30AM", "11:00-11:15PM", "12:00AM" (for midnight markets)
-            time_pattern = r'(\d{1,2}):?(\d{2})?-?(\d{1,2})?:?(\d{2})?(AM|PM)'
-            match = re.search(time_pattern, title, re.IGNORECASE)
-            
-            if not match:
-                # Also try hourly market pattern: "January 18, 12AM ET"
-                hourly_pattern = r'(\d{1,2})(AM|PM)\s+ET'
-                hourly_match = re.search(hourly_pattern, title, re.IGNORECASE)
-                
-                if hourly_match:
-                    hour = int(hourly_match.group(1))
-                    ampm = hourly_match.group(2).upper()
-                    
-                    if ampm == 'PM' and hour != 12:
-                        hour += 12
-                    elif ampm == 'AM' and hour == 12:
-                        hour = 0
-                    
-                    # Hourly markets are active for the full hour
-                    start_time = datetime(market_date.year, market_date.month, market_date.day, hour, 0)
-                    end_time = start_time + timedelta(hours=1)
-                    
-                    start_time = et_tz.localize(start_time)
-                    end_time = et_tz.localize(end_time)
-                    
-                    return start_time <= now_et < end_time
-                
-                # Can't parse - assume not active
-                return False
-            
-            # Parse start time
-            start_hour = int(match.group(1))
-            start_min = int(match.group(2)) if match.group(2) else 0
-            ampm = match.group(5).upper()
-            
-            # Parse end time if present (for 15-min markets)
-            if match.group(3):
-                end_hour = int(match.group(3))
-                end_min = int(match.group(4)) if match.group(4) else 0
+            # Handle different date formats
+            if 'T' in end_date:
+                # Full timestamp format: "2026-01-22T21:00:00Z"
+                market_date = datetime.fromisoformat(end_date.replace('Z', '+00:00')).date()
             else:
-                # Single time - assume 15 min market
-                end_hour = start_hour
-                end_min = start_min + 15
-                if end_min >= 60:
-                    end_min -= 60
-                    end_hour += 1
+                # Simple date format: "2026-01-22"
+                market_date = datetime.strptime(end_date, "%Y-%m-%d").date()
             
-            # Convert to 24h format
-            if ampm == 'PM' and start_hour != 12:
-                start_hour += 12
-            elif ampm == 'AM' and start_hour == 12:
-                start_hour = 0
+            # Extract time range from title using multiple regex patterns
+            # Format 1: "3:45PM-4:00PM" (both times have AM/PM)
+            # Format 2: "3:15-3:30AM" (only end has AM/PM)
+            # Format 3: "12AM" (hourly market)
             
-            if ampm == 'PM' and end_hour != 12:
-                end_hour += 12
-            elif ampm == 'AM' and end_hour == 12:
-                end_hour = 0
+            start_hour = None
+            start_min = 0
+            end_hour = None
+            end_min = 0
+            ampm = None
+            
+            # Try format: "H:MMAM/PM-H:MMAM/PM" (e.g., "3:45PM-4:00PM")
+            full_pattern = r'(\d{1,2}):(\d{2})(AM|PM)-(\d{1,2}):(\d{2})(AM|PM)'
+            full_match = re.search(full_pattern, title, re.IGNORECASE)
+            
+            if full_match:
+                start_hour = int(full_match.group(1))
+                start_min = int(full_match.group(2))
+                start_ampm = full_match.group(3).upper()
+                end_hour = int(full_match.group(4))
+                end_min = int(full_match.group(5))
+                end_ampm = full_match.group(6).upper()
+                
+                # Convert to 24h
+                if start_ampm == 'PM' and start_hour != 12:
+                    start_hour += 12
+                elif start_ampm == 'AM' and start_hour == 12:
+                    start_hour = 0
+                if end_ampm == 'PM' and end_hour != 12:
+                    end_hour += 12
+                elif end_ampm == 'AM' and end_hour == 12:
+                    end_hour = 0
+            else:
+                # Try format: "H:MM-H:MMAM/PM" (e.g., "3:15-3:30AM")
+                range_pattern = r'(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})(AM|PM)'
+                range_match = re.search(range_pattern, title, re.IGNORECASE)
+                
+                if range_match:
+                    start_hour = int(range_match.group(1))
+                    start_min = int(range_match.group(2))
+                    end_hour = int(range_match.group(3))
+                    end_min = int(range_match.group(4))
+                    ampm = range_match.group(5).upper()
+                    
+                    # Convert to 24h (both use same AM/PM)
+                    if ampm == 'PM' and start_hour != 12:
+                        start_hour += 12
+                    elif ampm == 'AM' and start_hour == 12:
+                        start_hour = 0
+                    if ampm == 'PM' and end_hour != 12:
+                        end_hour += 12
+                    elif ampm == 'AM' and end_hour == 12:
+                        end_hour = 0
+                else:
+                    # Try hourly format: "12AM ET" or "3PM ET"
+                    hourly_pattern = r'(\d{1,2})(AM|PM)\s+ET'
+                    hourly_match = re.search(hourly_pattern, title, re.IGNORECASE)
+                    
+                    if hourly_match:
+                        start_hour = int(hourly_match.group(1))
+                        ampm = hourly_match.group(2).upper()
+                        
+                        if ampm == 'PM' and start_hour != 12:
+                            start_hour += 12
+                        elif ampm == 'AM' and start_hour == 12:
+                            start_hour = 0
+                        
+                        # Hourly markets: full hour
+                        end_hour = start_hour + 1
+                        end_min = 0
+                        start_min = 0
+                    else:
+                        # Can't parse - assume market IS active (safer)
+                        logger.debug(f"Can't parse time from title: {title}")
+                        return True
+            
+            if start_hour is None:
+                return True  # Can't parse, assume active
             
             # Build datetime objects
             start_time = datetime(market_date.year, market_date.month, market_date.day, start_hour, start_min)
@@ -308,8 +365,9 @@ class WhaleCopyStrategy(BaseStrategy):
             return start_time <= now_et < end_time
             
         except Exception as e:
-            logger.debug(f"Error parsing market time: {e} | Title: {title}")
-            return False
+            logger.warning(f"Error parsing market time: {e} | Title: {title} | end_date: {end_date}")
+            # If we can't parse, assume market IS active (safer - don't reset positions)
+            return True
     
     async def _get_whale_positions(self) -> List[Dict]:
         """
@@ -349,206 +407,370 @@ class WhaleCopyStrategy(BaseStrategy):
             logger.error(f"Error fetching whale positions: {e}")
             return all_active_crypto
     
-    async def _log_whale_positions(self, positions: List[Dict], active_positions: List[Dict] = None) -> None:
-        """Log whale positions in ACTIVE markets only, grouped by wallet"""
-        active_positions = active_positions or []
+    async def _get_actual_balance_for_sell(self, token_id: str) -> float:
+        """
+        Get ACTUAL balance for selling.
         
+        Note: Fees are paid in USDC, not shares (per Polymarket docs).
+        Fallbacks use 3% safety margin to avoid "not enough balance" errors.
+        
+        Priority for sells:
+        1. API query (most accurate - on-chain balance)
+        2. Trader's active_positions (with 3% safety margin)
+        3. Our tracked positions (with 3% safety margin)
+        """
+        # 1. Query API first - shows ACTUAL on-chain balance
+        try:
+            our_wallet = self.trader.funder_address or self.trader.signer_address
+            if our_wallet:
+                url = f"https://data-api.polymarket.com/positions?user={our_wallet}"
+                response = await self.http_client.get(url)
+                
+                if response.status_code == 200:
+                    positions = response.json()
+                    for pos in positions:
+                        if pos.get('asset') == token_id:
+                            size = float(pos.get('size', 0))
+                            if size > 0:
+                                logger.info(f"[SELL BALANCE] {token_id[:10]}... = {size:.4f} (from API)")
+                                return size
+            
+        except Exception as e:
+            logger.warning(f"API position query failed: {e}")
+        
+        # 2. Fallback: use trader's tracked shares with 3% safety margin
+        if hasattr(self.trader, 'active_positions') and token_id in self.trader.active_positions:
+            tracked = self.trader.active_positions[token_id].get('shares', 0)
+            if tracked > 0:
+                safe_amount = tracked * 0.968  # 3% safety margin
+                logger.warning(f"[SELL BALANCE] {token_id[:10]}... = {safe_amount:.2f} (from trader, -3%)")
+                return safe_amount
+        
+        # 3. Last fallback: our tracked positions with 3% safety margin
+        for slug, pos in self.positions.items():
+            if pos.get('token_id') == token_id:
+                size = pos.get('size', 0) * 0.968  # 3% safety margin
+                logger.warning(f"[SELL BALANCE] {token_id[:10]}... = {size:.2f} (from tracked, -3%)")
+                return size
+        
+        logger.debug(f"[SELL BALANCE] {token_id[:10]}... = 0 (not found)")
+        return 0.0
+    
+    async def _get_our_token_balance(self, token_id: str) -> float:
+        """
+        Get our token balance for checking if we have a position.
+        
+        Note: For SELLING, use _get_actual_balance_for_sell() instead,
+        as this function returns gross amounts that don't account for fees.
+        
+        Priority:
+        1. Trader's active_positions (immediate)
+        2. API query (accurate but may have delay)
+        3. Our tracked size (fallback)
+        """
+        # 1. Check trader's local tracking
+        if hasattr(self.trader, 'active_positions') and token_id in self.trader.active_positions:
+            pos = self.trader.active_positions[token_id]
+            shares = pos.get('shares', 0)
+            if shares > 0:
+                logger.debug(f"[BALANCE] {token_id[:10]}... = {shares:.2f} (from trader)")
+                return shares
+        
+        # 2. Query API
+        try:
+            our_wallet = self.trader.funder_address or self.trader.signer_address
+            if our_wallet:
+                url = f"https://data-api.polymarket.com/positions?user={our_wallet}"
+                response = await self.http_client.get(url)
+                
+                if response.status_code == 200:
+                    positions = response.json()
+                    for pos in positions:
+                        if pos.get('asset') == token_id:
+                            size = float(pos.get('size', 0))
+                            if size > 0:
+                                logger.debug(f"[BALANCE] {token_id[:10]}... = {size:.2f} (from API)")
+                                return size
+            
+        except Exception as e:
+            logger.debug(f"API position query failed: {e}")
+        
+        # 3. Fallback: check our tracked positions
+        for slug, pos in self.positions.items():
+            if pos.get('token_id') == token_id:
+                size = pos.get('size', 0)
+                logger.debug(f"[BALANCE] {token_id[:10]}... = {size:.2f} (from tracked)")
+                return size
+        
+        logger.debug(f"[BALANCE] {token_id[:10]}... = 0 (not found)")
+        return 0.0
+    
+    def _log_new_positions(self, active_positions: List[Dict]) -> None:
+        """Log NEW whale positions in active markets (once per position)"""
         if not active_positions:
-            logger.info(f"No whale positions in active markets ({len(self.target_wallets)} wallets monitored)")
             return
         
-        logger.info("=" * 70)
-        logger.info(f"WHALE ACTIVE POSITIONS ({len(active_positions)} positions from {len(self.target_wallets)} wallets)")
-        logger.info("=" * 70)
+        # Calculate NET exposures per market (signed)
+        net_exposures = self._calculate_net_exposures(active_positions)
         
-        # Group by wallet, then by crypto
-        by_wallet = {}
-        for pos in active_positions:
-            wallet = pos.get('wallet', 'unknown')
-            wallet_short = f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 10 else wallet
-            if wallet_short not in by_wallet:
-                by_wallet[wallet_short] = {}
+        for slug, exp in net_exposures.items():
+            net_value = exp['net_value']  # SIGNED: positive=UP, negative=DOWN
             
-            slug = pos.get('slug', '')
-            for crypto in self.CRYPTO_SLUGS:
-                if crypto in slug.lower():
-                    if crypto not in by_wallet[wallet_short]:
-                        by_wallet[wallet_short][crypto] = []
-                    by_wallet[wallet_short][crypto].append(pos)
-                    break
-        
-        total_value = 0
-        for wallet_short, by_crypto in sorted(by_wallet.items()):
-            logger.info(f"\n[{wallet_short}]")
-            
-            for crypto, crypto_positions in sorted(by_crypto.items()):
-                logger.info(f"  {crypto.upper()}:")
-                for pos in crypto_positions:
-                    title = pos.get('title', '')[:45]
-                    outcome = pos.get('outcome', '')
-                    size = float(pos.get('size', 0))
-                    cur_price = float(pos.get('curPrice', 0))
-                    current_value = float(pos.get('currentValue', 0))
-                    total_bought = float(pos.get('totalBought', 0))
-                    
-                    total_value += current_value
-                    
-                    logger.info(
-                        f"    {outcome:5} | Size: {size:>10.2f} | "
-                        f"Price: {cur_price:.2f} | "
-                        f"Value: ${current_value:>8.2f} | "
-                        f"Bought: ${total_bought:>10.2f}"
-                    )
-                    logger.info(f"           {title}")
-        
-        logger.info("-" * 70)
-        logger.info(f"TOTAL ACTIVE VALUE (all whales): ${total_value:,.2f}")
-        
-        # Show our position if any
-        if self.copied_side:
-            logger.info(f"OUR POSITION: {self.copied_side.upper()} ${self.copied_size:.2f} in {self.copied_market_slug}")
-        
-        logger.info("=" * 70)
-    
-    async def _try_copy_whale_position(self, active_positions: List[Dict]) -> None:
-        """
-        Try to copy the whale's position in an active market.
-        
-        Rules:
-        - Only copy if whale has $MIN_WHALE_BUY or more in the position
-        - Only copy ONCE per market (even if order fails)
-        - Use fixed COPY_SIZE with GTC order
-        """
-        # Find the largest position that meets threshold
-        best_pos = None
-        best_value = 0
-        
-        for pos in active_positions:
-            slug = pos.get('slug', '')
-            total_bought = float(pos.get('totalBought', 0))
-            current_value = float(pos.get('currentValue', 0))
-            
-            # Skip markets we've already attempted
-            if slug in self.attempted_markets:
+            # Determine direction and check threshold
+            if net_value >= self.MIN_WHALE_BUY:
+                direction = 'up'
+                display_value = net_value
+            elif net_value <= -self.MIN_WHALE_BUY:
+                direction = 'down'
+                display_value = abs(net_value)
+            else:
+                # Below threshold, skip
                 continue
             
-            # Check if whale's position is significant
-            if total_bought >= self.MIN_WHALE_BUY and current_value > best_value:
-                best_pos = pos
-                best_value = current_value
-        
-        if not best_pos:
-            return
-        
-        # Extract position details
-        slug = best_pos.get('slug', '')
-        outcome = best_pos.get('outcome', '')  # 'Up' or 'Down'
-        token_id = best_pos.get('asset', '')
-        total_bought = float(best_pos.get('totalBought', 0))
-        title = best_pos.get('title', '')
-        cur_price = float(best_pos.get('curPrice', 0))
-        wallet = best_pos.get('wallet', 'unknown')
-        wallet_short = f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 10 else wallet
-        
-        side = outcome.lower()  # 'up' or 'down'
-        
-        # Mark this market as attempted (even before trying)
-        self.attempted_markets.add(slug)
-        
-        logger.info("=" * 60)
-        logger.info(f">>> WHALE DETECTED - COPYING!")
-        logger.info(f"  Whale: {wallet_short}")
-        logger.info(f"  Market: {title}")
-        logger.info(f"  Direction: {outcome}")
-        logger.info(f"  Whale invested: ${total_bought:,.0f}")
-        logger.info(f"  Current price: {cur_price:.2f}")
-        logger.info(f"  Copying: ${self.COPY_SIZE:.2f} (GTC order)")
-        logger.info("=" * 60)
-        
-        try:
-            # Use current price + small buffer for GTC order
-            # GTC will stay in orderbook if not immediately filled
-            limit_price = min(0.9, cur_price + 0.05)
+            # Create unique key for this position
+            position_key = (slug, direction)
             
-            # Build minimal market_info for the trader
-            market_info = {
-                'slug': slug,
-                'condition_id': best_pos.get('conditionId', ''),
-                'up_token_id': token_id if side == 'up' else best_pos.get('oppositeAsset', ''),
-                'down_token_id': token_id if side == 'down' else best_pos.get('oppositeAsset', ''),
-            }
-            
-            order = self.trader.place_buy_order(
-                token_id=token_id,
-                side=side,
-                price=limit_price,
-                size=self.COPY_SIZE,
-                market_info=market_info,
-                order_type="GTC"  # Good Till Cancelled - stays in orderbook
-            )
-            
-            if order:
-                logger.info(f"[OK] BUY order PLACED: {outcome} ${self.COPY_SIZE:.2f} @ {limit_price}")
+            # Only log if we haven't seen this position before
+            if position_key not in self.logged_positions:
+                self.logged_positions.add(position_key)
                 
-                # Mark that we've copied - no more buys allowed
-                self.copied_side = side
-                self.copied_size = self.COPY_SIZE
-                self.copied_token_id = token_id
-                self.copied_market_slug = slug
-                self.whale_last_buys = total_bought
-            else:
-                logger.warning("[FAIL] BUY order failed")
-                
-        except Exception as e:
-            logger.error(f"Error placing copy order: {e}")
+                title = exp['representative_pos'].get('title', '')[:60]
+                logger.info(
+                    f"[WHALE] New position: {direction.upper()} ${display_value:,.0f} net | {title}"
+                )
     
-    async def _check_position_exit(self, all_positions: List[Dict]) -> None:
+    async def _try_copy_whale_positions(self, active_positions: List[Dict]) -> None:
         """
-        Check if we should exit our position.
+        Try to copy whale positions in ALL active markets that meet threshold.
+        
+        Uses SIGNED net_value:
+        - net_value >= +MIN_WHALE_BUY: buy UP
+        - net_value <= -MIN_WHALE_BUY: buy DOWN
+        - Otherwise: skip (no conviction)
+        """
+        # Calculate net exposures per market
+        net_exposures = self._calculate_net_exposures(active_positions)
+        
+        for slug, exposure in net_exposures.items():
+            # Skip markets where we already have a position
+            if slug in self.positions:
+                continue
+            
+            # Check if market is still active (not ended)
+            rep_pos = exposure['representative_pos']
+            title = rep_pos.get('title', '')
+            end_date = rep_pos.get('endDate', '')
+            if not self._is_market_active_now(title, end_date):
+                continue  # Market ended, don't buy
+            
+            # Check cooldown - don't buy if we recently sold this market
+            if slug in self.sell_cooldowns:
+                cooldown_end = self.sell_cooldowns[slug] + timedelta(seconds=self.SELL_COOLDOWN_SECONDS)
+                if datetime.now() < cooldown_end:
+                    remaining = (cooldown_end - datetime.now()).seconds
+                    logger.debug(f"[COOLDOWN] {slug}: {remaining}s remaining")
+                    continue
+                else:
+                    # Cooldown expired, remove it
+                    del self.sell_cooldowns[slug]
+            
+            net_value = exposure['net_value']  # SIGNED: positive=UP, negative=DOWN
+            
+            # Determine side based on signed net_value
+            if net_value >= self.MIN_WHALE_BUY:
+                side = 'up'
+            elif net_value <= -self.MIN_WHALE_BUY:
+                side = 'down'
+            else:
+                # No clear conviction, skip
+                continue
+            
+            # Extract position details
+            token_id = exposure['up_token_id'] if side == 'up' else exposure['down_token_id']
+            cur_price = exposure['up_price'] if side == 'up' else exposure['down_price']
+            
+            # Validate token_id exists
+            if not token_id:
+                logger.warning(f"[SKIP] {slug}: No token_id for {side.upper()}")
+                continue
+            
+            try:
+                limit_price = min(0.9, cur_price + 0.05)
+                
+                market_info = {
+                    'slug': slug,
+                    'condition_id': exposure['condition_id'],
+                    'up_token_id': exposure['up_token_id'],
+                    'down_token_id': exposure['down_token_id'],
+                }
+                
+                # Log whale position before buying
+                net_value = exposure['net_value']
+                whale_dir = 'UP' if net_value > 0 else 'DOWN'
+                logger.info(f"[WHALE] {whale_dir} ${abs(net_value):,.0f} net | {title}")
+                
+                # Use FOK (Fill or Kill) with high price to ensure immediate fill
+                market_price = 0.99  # High price to guarantee fill
+                
+                order = self.trader.place_buy_order(
+                    token_id=token_id,
+                    side=side,
+                    price=market_price,
+                    size=self.COPY_SIZE,
+                    market_info=market_info,
+                    order_type="FOK"  # Fill or Kill - immediate execution
+                )
+                
+                if order:
+                    # Get actual shares from trader's active_positions
+                    actual_shares = self.COPY_SIZE  # default
+                    if hasattr(self.trader, 'active_positions') and token_id in self.trader.active_positions:
+                            actual_shares = self.trader.active_positions[token_id].get('shares', self.COPY_SIZE)
+                    
+                    logger.info(f"[BUY] {side.upper()} {actual_shares:.2f} @ market | {title}")
+                    
+                    self.positions[slug] = {
+                        'side': side,
+                        'size': actual_shares,
+                        'token_id': token_id,
+                        'up_token_id': exposure['up_token_id'],
+                        'down_token_id': exposure['down_token_id'],
+                        'condition_id': exposure['condition_id'],
+                        'title': title,  # Store for market active check
+                        'end_date': end_date,  # Store for market active check
+                    }
+                else:
+                    logger.warning(f"[BUY FAILED] {side.upper()} {self.COPY_SIZE} | {title}")
+                    
+            except Exception as e:
+                logger.error(f"BUY error ({slug}): {e}")
+    
+    async def _check_all_positions_exit(self, all_positions: List[Dict]) -> None:
+        """
+        Check exit conditions for ALL our positions.
+        
+        Uses SIGNED net_value:
+        - Positive = whale bullish (UP)
+        - Negative = whale bearish (DOWN)
         
         Exit conditions:
-        - The market is no longer in active period (ended)
-        - Whale sold their position (not in active positions anymore)
+        - Market period ended: reset
+        - Whale exited: sell
+        - Conviction dropped: sell (net_value crossed threshold)
         """
-        if not self.copied_side or not self.copied_market_slug:
+        if not self.positions:
             return
         
-        # Find our copied market in whale's current positions
-        whale_still_holds = False
-        market_still_active = False
+        # Calculate net exposures for all markets
+        net_exposures = self._calculate_net_exposures(all_positions)
         
-        for pos in all_positions:
-            if pos.get('slug') == self.copied_market_slug and pos.get('outcome', '').lower() == self.copied_side:
-                whale_still_holds = True
-                
-                # Check if market is still active
-                title = pos.get('title', '')
-                end_date = pos.get('endDate', '')
-                market_still_active = self._is_market_active_now(title, end_date)
-                break
-        
-        # If market period ended, log once and reset
-        if not market_still_active and self.copied_size > 0:
-            logger.info("=" * 60)
-            logger.info(f"MARKET PERIOD ENDED: {self.copied_market_slug}")
-            logger.info(f"  Our position: {self.copied_side.upper()} ${self.copied_size:.2f}")
-            logger.info(f"  Waiting for resolution...")
-            logger.info("=" * 60)
-            # Reset position - we'll wait for resolution
-            self._reset_position()
-            return
-        
-        # If whale no longer holds position (but market still active), consider selling
-        if not whale_still_holds and self.copied_size > 0 and market_still_active:
-            logger.info("=" * 60)
-            logger.info(f"[!] WHALE EXITED - Consider selling")
-            logger.info(f"  Market: {self.copied_market_slug}")
-            logger.info(f"  Our position: {self.copied_side.upper()} ${self.copied_size:.2f}")
-            logger.info("=" * 60)
+        # Check each of our positions
+        # Use list() to avoid "dictionary changed size during iteration"
+        for slug in list(self.positions.keys()):
+            pos = self.positions[slug]
+            our_side = pos['side']
             
-            # Optional: Auto-sell when whale exits
-            # For now, just log - user can enable auto-sell if desired
-            # await self._sell_position("whale exited")
+            # Check if market is still active using STORED values (not whale positions)
+            title = pos.get('title', '')
+            end_date = pos.get('end_date', '')
+            
+            if not self._is_market_active_now(title, end_date):
+                logger.info(f"[END] {slug}: Market ended | {our_side.upper()} {pos['size']}")
+                self._reset_position(slug)
+                continue
+            
+            # Check whale's exposure in this market
+            if slug not in net_exposures:
+                # Whale has no positions - sell
+                await self._sell_position(slug, "whale exited")
+                continue
+            
+            exposure = net_exposures[slug]
+            net_value = exposure['net_value']  # SIGNED: positive=UP, negative=DOWN
+            
+            # Unified exit logic using signed net_value:
+            # - UP position: need net_value >= +threshold to hold
+            # - DOWN position: need net_value <= -threshold to hold
+            should_sell = False
+            reason = ""
+            
+            if our_side == 'up':
+                if net_value < self.MIN_WHALE_BUY:
+                    should_sell = True
+                    reason = f"net ${net_value:.0f} < +${self.MIN_WHALE_BUY}"
+            else:  # our_side == 'down'
+                if net_value > -self.MIN_WHALE_BUY:
+                    should_sell = True
+                    reason = f"net ${net_value:.0f} > -${self.MIN_WHALE_BUY}"
+            
+            if should_sell:
+                # Log whale's current position before selling
+                whale_direction = 'UP' if net_value > 0 else 'DOWN'
+                title = exposure['representative_pos'].get('title', '')[:60]
+                logger.info(f"[WHALE] Position changed: {whale_direction} ${abs(net_value):,.0f} net | {title}")
+                
+                await self._sell_position(slug, reason, apply_cooldown=False)
+                # No cooldown - if whale now has conviction in opposite direction,
+                # next loop will buy it
+            
+            # Otherwise: hold (do nothing)
+    
+    async def _sell_position(self, slug: str, reason: str, apply_cooldown: bool = True) -> None:
+        """
+        Sell our position in a specific market.
+        
+        Queries actual token balance before selling to account for fees.
+        
+        Args:
+            slug: Market slug to sell
+            reason: Reason for selling (for logging)
+            apply_cooldown: If True, set cooldown to prevent immediate re-buy.
+                           Set to False when selling due to direction change,
+                           so next loop can buy the new direction.
+        """
+        if slug not in self.positions:
+            return
+        
+        pos = self.positions[slug]
+        token_id = pos['token_id']
+        tracked_balance = pos.get('size', 0)
+        
+        # Get ACTUAL on-chain balance (API first, accounts for fees)
+        actual_balance = await self._get_actual_balance_for_sell(token_id)
+        
+        # Use actual balance from API
+        sell_size = actual_balance if actual_balance > 0 else (tracked_balance * 0.97)
+        
+        # Log for debugging
+        logger.info(f"[SELL ATTEMPT] {pos['side'].upper()} | api_balance={actual_balance:.2f}, tracked={tracked_balance:.2f}, selling={sell_size:.2f}")
+        
+        if sell_size <= 0:
+            logger.warning(f"[SELL SKIP] No balance for {pos['side'].upper()} | {slug[:30]}")
+            return
+        
+        try:
+            sell_order = self.trader.place_sell_order(
+                token_id=token_id,
+                price=0.01,  # Very low price to ensure fill (market sell)
+                size=sell_size,
+                order_type="GTC"  # GTC more reliable than FOK for sells
+            )
+            
+            if sell_order:
+                logger.info(f"[SELL] {pos['side'].upper()} {sell_size:.2f} | {slug[:30]} | {reason}")
+                # Set cooldown only if requested (not for direction changes)
+                if apply_cooldown:
+                    self.sell_cooldowns[slug] = datetime.now()
+                # Only reset position if sell succeeded
+                self._reset_position(slug)
+            else:
+                # SELL FAILED - keep position tracked to prevent buying opposite side!
+                logger.warning(f"[SELL FAILED] {pos['side'].upper()} {sell_size:.2f} | {slug[:30]} - keeping position")
+                
+        except Exception as e:
+            logger.error(f"SELL error ({slug}): {e}")
+            # Don't reset on error - we still hold the tokens
+    
     
     async def _get_whale_activity(self) -> tuple[Optional[WhaleActivity], List[str]]:
         """
@@ -815,49 +1037,32 @@ class WhaleCopyStrategy(BaseStrategy):
         We don't react to price changes directly in this strategy -
         all logic is in the whale monitor loop.
         """
-        # Update token IDs if needed
-        if not self.current_up_token:
-            self.current_up_token = up_token_id
-        if not self.current_down_token:
-            self.current_down_token = down_token_id
+        # This strategy doesn't use price updates - everything is handled in _whale_monitor_loop
+        pass
     
     async def on_market_end(self, market_data: Dict, winner: Optional[str]) -> None:
         """Called when a market ends (from main bot framework)"""
-        # Log if we had a position in this specific market
-        market_slug = market_data.get('slug', self.current_market_slug)
+        market_slug = market_data.get('slug', '')
         
-        if self.copied_market_slug == market_slug and self.copied_size > 0:
-            logger.info("=" * 60)
-            logger.info(f"MARKET ENDED: {market_slug}")
-            logger.info(f"  Position: {self.copied_side.upper()} ${self.copied_size:.2f}")
-            
+        # Check if we have a position in this market
+        if market_slug in self.positions:
+            pos = self.positions[market_slug]
             if winner:
-                won = (winner.upper() == self.copied_side.upper())
+                won = (winner.upper() == pos['side'].upper())
                 result = "WON" if won else "LOST"
-                logger.info(f"  Result: {result}")
+                logger.info(f"[RESULT] {result} | {pos['side'].upper()} {pos['size']} | {market_slug[:30]}")
             
-            logger.info("=" * 60)
-            
-            # Reset position for next opportunity
-            self._reset_position()
-        
-        # Reset current market tracking
-        self.current_market_slug = None
-        self.current_up_token = None
-        self.current_down_token = None
-        self.market_end_time = None
+            # Reset position for this market
+            self._reset_position(market_slug)
     
     async def shutdown(self) -> None:
         """Clean up on shutdown"""
-        logger.info(f"Shutting down {self.name} strategy...")
-        
-        # Cancel monitor
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
         
-        # Close HTTP client
         await self.http_client.aclose()
         
-        # Log final position
-        if self.copied_side and self.copied_size > 0:
-            logger.info(f"Final position in {self.copied_market_slug}: {self.copied_side.upper()} ${self.copied_size:.2f}")
+        if self.positions:
+            logger.info(f"[SHUTDOWN] Open positions: {len(self.positions)}")
+            for slug, pos in self.positions.items():
+                logger.info(f"  {pos['side'].upper()} {pos['size']} | {slug[:40]}")
