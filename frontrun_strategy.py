@@ -112,22 +112,23 @@ class FrontrunStrategy:
         self.signals_written = 0
     
     def _open_csv(self):
-        """Open CSV file for writing signals"""
+        """Open CSV file for writing signals (line-buffered for Docker)"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = os.path.join(OUTPUT_DIR, f"signals_{timestamp}.csv")
-        self.csv_file = open(filename, 'w', newline='')
+        # buffering=1 = line buffering, writes to disk after each line
+        self.csv_file = open(filename, 'w', newline='', buffering=1)
         fieldnames = list(Signal.__dataclass_fields__.keys())
         self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fieldnames)
         self.csv_writer.writeheader()
+        self.csv_file.flush()  # Ensure header is written
         logger.warning(f"Writing signals to: {filename}")
     
     def _write_signal(self, signal: Signal):
         """Write completed signal to CSV"""
         if self.csv_writer:
             self.csv_writer.writerow(asdict(signal))
+            self.csv_file.flush()  # Flush every signal for Docker
             self.signals_written += 1
-            if self.signals_written % 10 == 0:
-                self.csv_file.flush()
     
     def _process_binance_trade(self, data: dict):
         """Process Binance aggTrade - optimized for speed"""
