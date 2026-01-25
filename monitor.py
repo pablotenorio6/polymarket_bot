@@ -74,7 +74,7 @@ class FastMarketMonitor:
     - Fresh (use_persistent_client=False): For sync wrappers, creates new client each call
     """
     
-    def __init__(self, use_persistent_client: bool = False, market_prefix: str = "btc-updown-15m-"):
+    def __init__(self, use_persistent_client: bool = False, market_prefix: str = "btc-updown-15m-", market_type: str = "15min"):
         self.et_tz = pytz.timezone('America/New_York')
         
         # Client mode
@@ -95,9 +95,10 @@ class FastMarketMonitor:
         self.price_cache: Dict[str, float] = {}  # token_id -> price
         self.last_price_update: Optional[datetime] = None
         
-        # Market prefix to monitor (configurable per instance)
+        # Market configuration
         self.market_prefixes = [market_prefix]
-        logger.debug(f"Monitor initialized for market prefix: {market_prefix}")
+        self.market_type = market_type  # "15min" or "hourly"
+        logger.debug(f"Monitor initialized for {market_type} markets, prefix: {market_prefix}")
     
     async def close(self):
         """Clean up resources"""
@@ -105,6 +106,13 @@ class FastMarketMonitor:
             await self._persistent_client.close()
     
     def _generate_current_slugs(self) -> List[str]:
+        """Generate slugs for current and adjacent market periods"""
+        if self.market_type == "hourly":
+            return self._generate_hourly_slugs()
+        else:
+            return self._generate_15min_slugs()
+    
+    def _generate_15min_slugs(self) -> List[str]:
         """Generate slugs for current and adjacent 15-min periods"""
         now_et = datetime.now(self.et_tz)
         current_minute = now_et.minute
@@ -119,6 +127,54 @@ class FastMarketMonitor:
                 slugs.append(f"{prefix}{timestamp}")
         
         return slugs
+    
+    def _generate_hourly_slugs(self) -> List[str]:
+        """
+        Generate slugs for current and adjacent hourly markets.
+        
+        Hourly market slug format: {prefix}{month}-{day}-{hour}{am/pm}-et
+        Example: bitcoin-up-or-down-january-23-4pm-et
+        """
+        now_et = datetime.now(self.et_tz)
+        # Round to current hour
+        current_hour = now_et.replace(minute=0, second=0, microsecond=0)
+        
+        slugs = []
+        for prefix in self.market_prefixes:
+            # Check -1, 0, +1, +2 hour periods
+            for i in range(-1, 3):
+                time_offset = current_hour + timedelta(hours=i)
+                slug = self._format_hourly_slug(prefix, time_offset)
+                slugs.append(slug)
+        
+        return slugs
+    
+    def _format_hourly_slug(self, prefix: str, dt: datetime) -> str:
+        """
+        Format a datetime into an hourly market slug.
+        
+        Args:
+            prefix: Market prefix (e.g., "bitcoin-up-or-down-")
+            dt: Datetime to format
+            
+        Returns:
+            Slug like "bitcoin-up-or-down-january-23-4pm-et"
+        """
+        month = dt.strftime('%B').lower()  # january, february, etc.
+        day = dt.day  # No leading zero
+        hour = dt.hour
+        
+        # Convert to 12-hour format
+        if hour == 0:
+            hour_str = "12am"
+        elif hour < 12:
+            hour_str = f"{hour}am"
+        elif hour == 12:
+            hour_str = "12pm"
+        else:
+            hour_str = f"{hour - 12}pm"
+        
+        return f"{prefix}{month}-{day}-{hour_str}-et"
     
     def _generate_future_slugs(self, hours_ahead: int = 24) -> List[str]:
         """
@@ -215,9 +271,31 @@ class FastMarketMonitor:
             if not event.get('active') or event.get('closed'):
                 continue
             
-            # Check if currently active
-            start_dt = parser.parse(event.get('startTime', ''))
-            end_dt = parser.parse(event.get('endDate', ''))
+            # Check if currently active - validate dates first
+            start_time_str = event.get('startTime')
+            end_date_str = event.get('endDate', '')
+            
+            if not end_date_str:
+                logger.debug(f"Event missing endDate: {event.get('slug', 'unknown')}")
+                continue
+            
+            try:
+                end_dt = parser.parse(end_date_str)
+                
+                # Handle hourly markets where startTime is None
+                if start_time_str:
+                    start_dt = parser.parse(start_time_str)
+                else:
+                    # For hourly markets, startTime is 1 hour before endDate
+                    if self.market_type == "hourly":
+                        start_dt = end_dt - timedelta(hours=1)
+                    else:
+                        # For 15min markets, startTime is 15min before endDate
+                        start_dt = end_dt - timedelta(minutes=15)
+                    logger.debug(f"Inferred startTime for {event.get('slug', 'unknown')}: {start_dt}")
+            except Exception as e:
+                logger.debug(f"Failed to parse dates for event {event.get('slug', 'unknown')}: {e}")
+                continue
             
             if start_dt <= now_utc <= end_dt:
                 markets = event.get('markets', [])

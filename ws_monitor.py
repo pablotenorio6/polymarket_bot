@@ -358,3 +358,279 @@ class HybridPriceMonitor:
     async def close(self):
         """Close connections"""
         await self.ws_monitor.close()
+
+
+# WebSocket endpoint for user channel
+WS_USER_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+
+
+class WebSocketUserFillsTracker:
+    """
+    Real-time tracker for user order fills using Polymarket WebSocket.
+    
+    This provides instant updates when orders are filled, much faster than
+    polling the data API (which has ~30s delay).
+    
+    Usage:
+        tracker = WebSocketUserFillsTracker(clob_client)
+        await tracker.start()
+        # After starting, positions are updated in real-time
+        balance = tracker.get_balance(token_id)
+    """
+    
+    __slots__ = (
+        'client', 'ws', 'positions', 'connected', 'running',
+        'reconnect_delay', 'max_reconnect_delay', 'condition_ids'
+    )
+    
+    def __init__(self, clob_client):
+        """
+        Initialize with a ClobClient that has API credentials set.
+        
+        Args:
+            clob_client: Authenticated py_clob_client.ClobClient instance
+        """
+        self.client = clob_client
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.positions: Dict[str, float] = {}  # token_id -> shares
+        self.connected = False
+        self.running = False
+        self.reconnect_delay = 1.0
+        self.max_reconnect_delay = 30.0
+        self.condition_ids: List[str] = []
+    
+    def _get_auth_message(self) -> Optional[Dict]:
+        """Get authentication message using client's API credentials"""
+        try:
+            # Access the client's API credentials
+            creds = self.client.creds
+            if not creds:
+                logger.error("No API credentials available on client")
+                return None
+            
+            # Auth fields as per Polymarket docs (lowercase)
+            return {
+                "apiKey": creds.api_key,
+                "secret": creds.api_secret,
+                "passphrase": creds.api_passphrase
+            }
+        except Exception as e:
+            logger.error(f"Failed to get auth credentials: {e}")
+            return None
+    
+    async def connect(self) -> bool:
+        """Establish WebSocket connection"""
+        try:
+            self.ws = await websockets.connect(
+                WS_USER_URL,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=5
+            )
+            self.connected = True
+            self.reconnect_delay = 1.0
+            logger.info(f"User WebSocket connected")
+            return True
+        except Exception as e:
+            logger.error(f"User WebSocket connection failed: {e}")
+            self.connected = False
+            return False
+    
+    async def subscribe(self, condition_ids: List[str]) -> bool:
+        """
+        Subscribe to user fills for specific markets.
+        
+        Args:
+            condition_ids: List of market condition IDs to monitor
+        """
+        if not self.ws or not self.connected:
+            logger.warning("Cannot subscribe: User WebSocket not connected")
+            return False
+        
+        auth = self._get_auth_message()
+        if not auth:
+            logger.error("Cannot subscribe: No authentication")
+            return False
+        
+        try:
+            message = {
+                "auth": auth,
+                "type": "USER",  # Uppercase as per Polymarket docs
+                "markets": condition_ids
+            }
+            await self.ws.send(json_dumps(message))
+            self.condition_ids = condition_ids
+            logger.info(f"Subscribed to user fills for {len(condition_ids)} markets")
+            return True
+        except Exception as e:
+            logger.error(f"User subscribe failed: {e}")
+            return False
+    
+    async def listen(self):
+        """Listen for fill events and update positions"""
+        self.running = True
+        
+        while self.running:
+            try:
+                if not self.ws or not self.connected:
+                    await self._reconnect()
+                    continue
+                
+                message = await self.ws.recv()
+                self._process_message(message)
+                
+            except ConnectionClosed:
+                logger.warning("User WebSocket connection closed")
+                self.connected = False
+                if self.running:
+                    await self._reconnect()
+            except ConnectionClosedError:
+                logger.warning("User WebSocket connection closed with error")
+                self.connected = False
+                if self.running:
+                    await self._reconnect()
+            except Exception as e:
+                logger.error(f"User WebSocket error: {e}")
+                await asyncio.sleep(1)
+    
+    def _process_message(self, raw_message: str):
+        """Process incoming fill/order messages"""
+        try:
+            data = json_loads(raw_message)
+            
+            # Handle array of events
+            events = data if isinstance(data, list) else [data]
+            
+            for event in events:
+                event_type = event.get('event_type')
+                
+                if event_type == 'trade':
+                    self._handle_trade(event)
+                elif event_type == 'order':
+                    self._handle_order(event)
+                    
+        except Exception as e:
+            logger.debug(f"Failed to parse user message: {e}")
+    
+    def _handle_trade(self, trade: Dict):
+        """
+        Handle trade fill event - update our position tracking.
+        
+        Trade statuses:
+        - MATCHED: Order matched, trade pending
+        - MINED: Transaction mined
+        - CONFIRMED: Transaction confirmed (final)
+        - FAILED: Trade failed
+        """
+        status = trade.get('status', '')
+        
+        # Only process confirmed or matched trades
+        if status not in ('MATCHED', 'MINED', 'CONFIRMED'):
+            return
+        
+        asset_id = trade.get('asset_id')
+        side = trade.get('side', '').upper()
+        size = float(trade.get('size', 0))
+        
+        # Log all trade fields once to understand the data structure
+        logger.debug(f"[WS TRADE RAW] {list(trade.keys())}")
+        
+        if not asset_id or not side or size <= 0:
+            return
+        
+        # Update position based on trade side
+        current = self.positions.get(asset_id, 0)
+        
+        # Log fee info if available (to check if WS includes net amounts)
+        fee = trade.get('fee', trade.get('maker_fee', trade.get('taker_fee')))
+        fee_info = f" | fee={fee}" if fee else ""
+        
+        if side == 'BUY':
+            self.positions[asset_id] = current + size
+            logger.info(f"[WS FILL] BUY {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
+        elif side == 'SELL':
+            self.positions[asset_id] = max(0, current - size)
+            logger.info(f"[WS FILL] SELL {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
+    
+    def _handle_order(self, order: Dict):
+        """Handle order placement/update/cancellation events"""
+        order_type = order.get('type', '')
+        
+        # Log order events for debugging
+        if order_type == 'PLACEMENT':
+            logger.debug(f"[WS ORDER] Placed: {order.get('side')} {order.get('original_size')} @ {order.get('price')}")
+        elif order_type == 'CANCELLATION':
+            logger.debug(f"[WS ORDER] Cancelled: {order.get('id', '')[:20]}...")
+    
+    async def _reconnect(self):
+        """Attempt to reconnect with exponential backoff"""
+        self.connected = False
+        
+        while self.running:
+            logger.info(f"User WebSocket reconnecting in {self.reconnect_delay}s...")
+            await asyncio.sleep(self.reconnect_delay)
+            
+            if await self.connect():
+                if self.condition_ids:
+                    await self.subscribe(self.condition_ids)
+                return
+            
+            self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+    
+    async def start(self, condition_ids: List[str] = None) -> bool:
+        """
+        Start the WebSocket tracker.
+        
+        Args:
+            condition_ids: Optional list of market condition IDs to subscribe to
+        """
+        if not await self.connect():
+            return False
+        
+        if condition_ids:
+            if not await self.subscribe(condition_ids):
+                return False
+        
+        # Start listening in background
+        asyncio.create_task(self.listen())
+        return True
+    
+    async def close(self):
+        """Close WebSocket connection"""
+        self.running = False
+        self.connected = False
+        
+        if self.ws:
+            try:
+                await self.ws.close()
+            except:
+                pass
+            self.ws = None
+        
+        logger.info("User WebSocket closed")
+    
+    def get_balance(self, token_id: str) -> float:
+        """
+        Get current balance for a token (instant, no API call).
+        
+        Returns tracked position size, or 0 if not tracked.
+        """
+        return self.positions.get(token_id, 0)
+    
+    def set_initial_balance(self, token_id: str, balance: float):
+        """
+        Set initial balance for a token (e.g., from API query at startup).
+        
+        This allows syncing with existing positions before WebSocket
+        starts tracking new fills.
+        """
+        self.positions[token_id] = balance
+    
+    async def add_condition_id(self, condition_id: str):
+        """Add a new condition ID and resubscribe to WebSocket"""
+        if condition_id not in self.condition_ids:
+            self.condition_ids.append(condition_id)
+            # Resubscribe with updated list
+            if self.connected and self.ws:
+                await self.subscribe(self.condition_ids)
+                logger.debug(f"[WS] Added market {condition_id[:10]}..., now tracking {len(self.condition_ids)} markets")

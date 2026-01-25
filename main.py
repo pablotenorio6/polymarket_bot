@@ -167,12 +167,14 @@ class FastTradingBot:
         self.market_prefix = market_info["prefix"]
         self.market_name = market_info["name"]
         self.market_symbol = market_info["symbol"]
+        self.market_type = market_info.get("type", "15min")  # "15min" or "hourly"
         
         # Display configuration
         logger.info("=" * 60)
         logger.info("POLYMARKET CRYPTO BOT")
         logger.info("=" * 60)
-        logger.info(f"Market: {self.market_name} ({self.market_symbol}) 15-min Up/Down")
+        market_duration = "Hourly" if self.market_type == "hourly" else "15-min"
+        logger.info(f"Market: {self.market_name} ({self.market_symbol}) {market_duration} Up/Down")
         logger.info(f"Mode: {mode.upper()} - {BOT_MODES[mode]}")
         logger.info(f"Strategy: {strategy_name}")
         if self.trading_enabled:
@@ -187,10 +189,11 @@ class FastTradingBot:
         self.future_scan_interval = 60  # Scan every 60 seconds
         
         # Core components (use persistent client for best performance)
-        # Pass market prefix to monitor
+        # Pass market prefix and type to monitor
         self.monitor = FastMarketMonitor(
             use_persistent_client=True,
-            market_prefix=self.market_prefix
+            market_prefix=self.market_prefix,
+            market_type=self.market_type
         )
         self.trader = FastTrader()
         self.risk_manager = FastRiskManager(self.trader)  # Inject trader

@@ -451,7 +451,6 @@ class FastTrader:
         # Round price
         price_rounded = round(price, 2)
         
-        tick_size = self._get_tick_size(token_id)
         
         logger.debug(f"BUY {side.upper()}: {size} shares @ ${price_rounded} (${size:.2f} total)")
         

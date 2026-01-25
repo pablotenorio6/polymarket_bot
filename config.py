@@ -42,6 +42,7 @@ REQUEST_TIMEOUT = 5  # HTTP request timeout
 # MULTI-MARKET SUPPORT
 # ============================================
 # Available crypto markets (slug prefixes)
+# 15-minute markets (have orderbook fees)
 AVAILABLE_MARKETS = {
     "btc": {
         "prefix": "btc-updown-15m-",
@@ -57,6 +58,20 @@ AVAILABLE_MARKETS = {
         "prefix": "sol-updown-15m-",
         "name": "Solana",
         "symbol": "SOL"
+    },
+    # Hourly markets (NO FEES - market orders are free)
+    # Slug format: bitcoin-up-or-down-{month}-{day}-{hour}{am/pm}-et
+    "btc-1h": {
+        "prefix": "bitcoin-up-or-down-",
+        "name": "Bitcoin Hourly",
+        "symbol": "BTC",
+        "type": "hourly"  # Flag to use different slug generation
+    },
+    "eth-1h": {
+        "prefix": "ethereum-up-or-down-",
+        "name": "Ethereum Hourly",
+        "symbol": "ETH",
+        "type": "hourly"
     }
 }
 
