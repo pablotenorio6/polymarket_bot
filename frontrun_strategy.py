@@ -85,6 +85,7 @@ class Signal:
 class FrontrunStrategy:
     """
     Low-latency strategy that monitors Binance trades and Polymarket orderbook.
+    Auto-refreshes tokens when hourly market changes.
     """
     
     def __init__(self, up_token_id: str, down_token_id: str):
@@ -110,6 +111,10 @@ class FrontrunStrategy:
         self.csv_file = None
         self.csv_writer = None
         self.signals_written = 0
+        
+        # Market refresh tracking
+        self.current_hour: int = datetime.now(timezone.utc).hour
+        self.needs_reconnect: bool = False
     
     def _open_csv(self):
         """Open CSV file for writing signals (line-buffered for Docker)"""
@@ -328,16 +333,17 @@ class FrontrunStrategy:
                     await asyncio.sleep(1)
     
     async def _polymarket_ws_loop(self):
-        """Polymarket WebSocket loop"""
+        """Polymarket WebSocket loop - reconnects on token refresh"""
         while self.running:
             try:
+                logger.warning(f"Connecting to Polymarket WS with tokens: UP={self.up_token_id[:16]}... DOWN={self.down_token_id[:16]}...")
                 async with websockets.connect(POLYMARKET_WS_URL, ping_interval=20, ping_timeout=10) as ws:
                     sub = {"auth": {}, "type": "market", "assets_ids": [self.up_token_id, self.down_token_id]}
                     await ws.send(json.dumps(sub))
                     
-                    while self.running:
+                    while self.running and not self.needs_reconnect:
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                            msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
                             self._process_polymarket_message(msg)
                         except asyncio.TimeoutError:
                             try:
@@ -346,7 +352,12 @@ class FrontrunStrategy:
                                 break
                         except:
                             break
-            except:
+                    
+                    # If reconnect needed, clear the flag
+                    if self.needs_reconnect:
+                        self.needs_reconnect = False
+                        logger.warning("Reconnecting with new tokens...")
+            except Exception as e:
                 if self.running:
                     await asyncio.sleep(1)
     
@@ -355,6 +366,47 @@ class FrontrunStrategy:
         while self.running:
             self._update_signal_prices()
             await asyncio.sleep(0.1)
+    
+    async def _market_refresh_loop(self):
+        """Check for hourly market change and refresh tokens"""
+        while self.running:
+            try:
+                now = datetime.now(timezone.utc)
+                current_hour = now.hour
+                
+                # Check if hour changed
+                if current_hour != self.current_hour:
+                    logger.warning(f"Hour changed: {self.current_hour} -> {current_hour}. Refreshing market tokens...")
+                    self.current_hour = current_hour
+                    
+                    # Clear stale price data
+                    self.up_bid = None
+                    self.up_ask = None
+                    self.down_bid = None
+                    self.down_ask = None
+                    
+                    # Cancel any active signals (they belong to old market)
+                    if self.active_signals:
+                        logger.warning(f"Discarding {len(self.active_signals)} active signals from previous market")
+                        self.active_signals.clear()
+                    
+                    # Fetch new market tokens
+                    try:
+                        new_up, new_down = await get_market_tokens()
+                        self.up_token_id = new_up
+                        self.down_token_id = new_down
+                        logger.warning(f"New tokens: UP={new_up[:16]}... DOWN={new_down[:16]}...")
+                        
+                        # Signal WebSocket to reconnect
+                        self.needs_reconnect = True
+                    except Exception as e:
+                        logger.error(f"Failed to refresh tokens: {e}")
+                
+                # Check every 10 seconds
+                await asyncio.sleep(10)
+            except Exception as e:
+                logger.error(f"Market refresh error: {e}")
+                await asyncio.sleep(10)
     
     async def run(self):
         """Run the strategy"""
@@ -368,7 +420,8 @@ class FrontrunStrategy:
         tasks = [
             asyncio.create_task(self._binance_ws_loop()),
             asyncio.create_task(self._polymarket_ws_loop()),
-            asyncio.create_task(self._tracker_loop())
+            asyncio.create_task(self._tracker_loop()),
+            asyncio.create_task(self._market_refresh_loop())
         ]
         
         try:
