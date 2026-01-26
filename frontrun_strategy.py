@@ -29,6 +29,8 @@ VOLATILITY_LOOKBACK_HOURS = 8  # Lookback for EWMA calculation
 MINUTES_PER_YEAR = 365 * 24 * 60
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 EWMA_LAMBDA = 0.97  # EWMA decay factor (higher = more smoothing, lower = more reactive)
+VOLATILITY_MULTIPLIER = 3  # Scale realized vol to approximate implied vol
+MIN_VOLATILITY = 0.25  # 25% floor
 
 # Minimal logging - only errors
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s|%(levelname)s|%(message)s')
@@ -325,9 +327,10 @@ class FrontrunStrategy:
             
             std_1min = math.sqrt(ewma_variance)
             
-            # Annualize
-            self.cached_volatility = std_1min * math.sqrt(MINUTES_PER_YEAR)
-            # logger.warning(f"Volatility EWMA(lambda={EWMA_LAMBDA}): {self.cached_volatility * 100:.1f}% annualized")
+            # Annualize and apply multiplier + floor
+            vol_raw = std_1min * math.sqrt(MINUTES_PER_YEAR)
+            self.cached_volatility = max(vol_raw * VOLATILITY_MULTIPLIER, MIN_VOLATILITY)
+            # logger.warning(f"Volatility: {self.cached_volatility * 100:.1f}% (raw={vol_raw*100:.1f}%, x{VOLATILITY_MULTIPLIER})")
             
         except Exception as e:
             logger.error(f"Failed to update volatility: {e}")
