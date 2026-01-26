@@ -2,8 +2,8 @@
 Binance-Polymarket Frontrun Strategy - Production Version
 
 Monitors Binance aggTrade and Polymarket orderbook via WebSocket.
-When aggregate trades >= THRESHOLD_BTC in 100ms window detected,
-logs signal and price evolution to CSV for analysis.
+Uses dynamic threshold (mean + 3*std of last 5 min) to detect significant
+directional volume imbalances. Logs signal and price evolution to CSV.
 
 Optimized for minimum latency.
 """
@@ -26,10 +26,14 @@ logging.basicConfig(level=logging.WARNING, format='%(asctime)s|%(levelname)s|%(m
 logger = logging.getLogger(__name__)
 
 # ============== CONFIGURATION ==============
-THRESHOLD_BTC = float(os.environ.get('THRESHOLD_BTC', '5.0'))
-AGG_WINDOW_MS = 100  # Aggregate trades in 100ms windows
+AGG_WINDOW_MS = 100  # Rolling window for trade aggregation
 TRACK_DURATION_MS = 5000  # Track prices for 5 seconds after signal
 TRACK_INTERVAL_MS = 500  # Record every 500ms
+
+# Dynamic threshold configuration
+MIN_THRESHOLD_BTC = float(os.environ.get('MIN_THRESHOLD_BTC', '5.0'))  # Floor minimum
+STD_MULTIPLIER = float(os.environ.get('STD_MULTIPLIER', '3.0'))  # Multiplier for std dev
+LOOKBACK_MS = int(os.environ.get('LOOKBACK_MS', '600000'))  # 5 minutes in ms
 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -51,6 +55,7 @@ class Signal:
     total_qty_btc: float
     trade_count: int
     binance_price: float
+    threshold_used: float  # Dynamic threshold at signal time
     
     # Initial prices at T=0
     up_ask_0: Optional[float] = None
@@ -99,9 +104,18 @@ class FrontrunStrategy:
         self.down_bid: Optional[float] = None
         self.down_ask: Optional[float] = None
         
-        # Binance trades buffer (rolling window)
+        # Binance trades buffer (rolling window) with incremental sums
         self.trade_buffer: deque = deque()
+        self.buy_qty_sum: float = 0.0  # Incremental sum of buy volume
+        self.sell_qty_sum: float = 0.0  # Incremental sum of sell volume
         self.last_signal_ms: int = 0  # Cooldown to avoid duplicate signals
+        self.last_price: float = 0.0  # Last trade price
+        
+        # Dynamic threshold tracking (updated async every 1s)
+        self.volume_history: deque = deque()  # (window_ms, max_net_volume) per 100ms window
+        self.current_window_ms: int = 0
+        self.current_window_max_vol: float = 0.0
+        self.current_threshold: float = MIN_THRESHOLD_BTC
         
         # Active signals being tracked
         self.active_signals: Dict[int, Signal] = {}
@@ -136,58 +150,95 @@ class FrontrunStrategy:
             self.signals_written += 1
     
     def _process_binance_trade(self, data: dict):
-        """Process Binance aggTrade with rolling window detection"""
+        """Process Binance aggTrade - O(1) optimized with incremental sums"""
         now_ms = int(time.time() * 1000)
+        qty = float(data.get('q', 0))
+        is_buyer_maker = data.get('m', False)
         
         trade = {
-            'qty': float(data.get('q', 0)),
-            'price': float(data.get('p', 0)),
-            'is_buyer_maker': data.get('m', False),
+            'qty': qty,
+            'is_buyer_maker': is_buyer_maker,
             'time_ms': now_ms
         }
         
-        # Add to buffer
+        # Add to buffer and update incremental sums
         self.trade_buffer.append(trade)
+        if is_buyer_maker:
+            self.sell_qty_sum += qty
+        else:
+            self.buy_qty_sum += qty
+        self.last_price = float(data.get('p', 0))
         
-        # Clean old trades outside the rolling window
+        # Remove old trades and subtract from sums (O(k) where k = expired trades, usually 0-1)
         cutoff = now_ms - AGG_WINDOW_MS
         while self.trade_buffer and self.trade_buffer[0]['time_ms'] < cutoff:
-            self.trade_buffer.popleft()
+            old = self.trade_buffer.popleft()
+            if old['is_buyer_maker']:
+                self.sell_qty_sum -= old['qty']
+            else:
+                self.buy_qty_sum -= old['qty']
         
-        # Check for signal on every trade (rolling window)
+        # Check for signal - O(1) operation now
         self._check_signal(now_ms)
     
     def _check_signal(self, now_ms: int):
-        """Check if NET directional volume in rolling window exceeds threshold"""
-        if not self.trade_buffer:
-            return
+        """Check if NET directional volume exceeds threshold - O(1) optimized"""
+        # Calculate net volume from incremental sums (O(1))
+        net_volume = abs(self.buy_qty_sum - self.sell_qty_sum)
+        
+        # Track max volume per 100ms window for threshold calculation
+        window_ms = (now_ms // AGG_WINDOW_MS) * AGG_WINDOW_MS
+        if window_ms != self.current_window_ms:
+            # New window - save previous window's max if significant
+            if self.current_window_ms > 0 and self.current_window_max_vol > 0:
+                self.volume_history.append((self.current_window_ms, self.current_window_max_vol))
+            self.current_window_ms = window_ms
+            self.current_window_max_vol = net_volume
+        else:
+            # Same window - track max
+            self.current_window_max_vol = max(self.current_window_max_vol, net_volume)
         
         # Cooldown: don't fire multiple signals within the same window
         if now_ms - self.last_signal_ms < AGG_WINDOW_MS:
             return
         
-        # Sum all trades in the rolling window
-        trade_count = 0
-        last_price = 0.0
-        buy_qty = 0.0
-        sell_qty = 0.0
-        
-        for trade in self.trade_buffer:
-            trade_count += 1
-            last_price = trade['price']
-            if trade['is_buyer_maker']:
-                sell_qty += trade['qty']
-            else:
-                buy_qty += trade['qty']
-        
-        # Calculate net directional volume
-        net_volume = abs(buy_qty - sell_qty)
-        
-        # Check threshold on NET volume (directional imbalance)
-        if net_volume >= THRESHOLD_BTC:
-            direction = 'SELL' if sell_qty > buy_qty else 'BUY'
-            self.last_signal_ms = now_ms  # Set cooldown
-            self._create_signal(now_ms, direction, net_volume, trade_count, last_price)
+        # Check threshold on NET volume
+        if net_volume >= self.current_threshold:
+            direction = 'SELL' if self.sell_qty_sum > self.buy_qty_sum else 'BUY'
+            self.last_signal_ms = now_ms
+            self._create_signal(now_ms, direction, net_volume, len(self.trade_buffer), self.last_price)
+    
+    async def _threshold_update_loop(self):
+        """Async loop to recalculate dynamic threshold every second"""
+        while self.running:
+            try:
+                now_ms = int(time.time() * 1000)
+                
+                # Clean old entries from volume history
+                cutoff = now_ms - LOOKBACK_MS
+                while self.volume_history and self.volume_history[0][0] < cutoff:
+                    self.volume_history.popleft()
+                
+                # Recalculate threshold if we have enough data
+                if len(self.volume_history) >= 10:
+                    volumes = [v for _, v in self.volume_history]
+                    mean_vol = sum(volumes) / len(volumes)
+                    
+                    if len(volumes) > 1:
+                        variance = sum((v - mean_vol) ** 2 for v in volumes) / len(volumes)
+                        std_vol = variance ** 0.5
+                    else:
+                        std_vol = 0
+                    
+                    dynamic_threshold = mean_vol + STD_MULTIPLIER * std_vol
+                    self.current_threshold = max(MIN_THRESHOLD_BTC, dynamic_threshold)
+                    
+                    # logger.warning(f"Threshold: {self.current_threshold:.2f} BTC (calc: {dynamic_threshold:.2f}, mean: {mean_vol:.2f}, std: {std_vol:.2f}, samples: {len(volumes)})")
+                
+                await asyncio.sleep(1)  # Update every 1 second
+            except Exception as e:
+                logger.error(f"Threshold update error: {e}")
+                await asyncio.sleep(1)
     
     def _create_signal(self, timestamp_ms: int, direction: str, qty: float, count: int, price: float):
         """Create new signal and start tracking"""
@@ -201,6 +252,7 @@ class FrontrunStrategy:
             total_qty_btc=qty,
             trade_count=count,
             binance_price=price,
+            threshold_used=self.current_threshold,
             up_ask_0=self.up_ask,
             up_bid_0=self.up_bid,
             down_ask_0=self.down_ask,
@@ -406,7 +458,7 @@ class FrontrunStrategy:
     
     async def run(self):
         """Run the strategy"""
-        logger.warning(f"Starting Frontrun Strategy | Threshold: {THRESHOLD_BTC} BTC")
+        logger.warning(f"Starting Frontrun Strategy | Dynamic Threshold: min={MIN_THRESHOLD_BTC} BTC, multiplier={STD_MULTIPLIER}x std, lookback={LOOKBACK_MS/1000:.0f}s")
         logger.warning(f"UP Token: {self.up_token_id[:20]}...")
         logger.warning(f"DOWN Token: {self.down_token_id[:20]}...")
         
@@ -417,7 +469,8 @@ class FrontrunStrategy:
             asyncio.create_task(self._binance_ws_loop()),
             asyncio.create_task(self._polymarket_ws_loop()),
             asyncio.create_task(self._tracker_loop()),
-            asyncio.create_task(self._market_refresh_loop())
+            asyncio.create_task(self._market_refresh_loop()),
+            asyncio.create_task(self._threshold_update_loop())
         ]
         
         try:
