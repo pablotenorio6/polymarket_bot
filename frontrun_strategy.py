@@ -327,7 +327,7 @@ class FrontrunStrategy:
             
             # Annualize
             self.cached_volatility = std_1min * math.sqrt(MINUTES_PER_YEAR)
-            logger.warning(f"Volatility EWMA(lambda={EWMA_LAMBDA}): {self.cached_volatility * 100:.1f}% annualized")
+            # logger.warning(f"Volatility EWMA(lambda={EWMA_LAMBDA}): {self.cached_volatility * 100:.1f}% annualized")
             
         except Exception as e:
             logger.error(f"Failed to update volatility: {e}")
