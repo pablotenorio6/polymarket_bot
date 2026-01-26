@@ -14,12 +14,21 @@ import json
 import time
 import os
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field, asdict
 from collections import deque
 
 import websockets
+import requests
+
+# Pricing constants
+VOLATILITY_UPDATE_INTERVAL = 60  # Update volatility every 30 seconds
+VOLATILITY_LOOKBACK_HOURS = 8  # Lookback for EWMA calculation
+MINUTES_PER_YEAR = 365 * 24 * 60
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+EWMA_LAMBDA = 0.97  # EWMA decay factor (higher = more smoothing, lower = more reactive)
 
 # Minimal logging - only errors
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s|%(levelname)s|%(message)s')
@@ -57,6 +66,13 @@ class Signal:
     binance_price: float
     threshold_used: float  # Dynamic threshold at signal time (with MIN floor)
     dynamic_threshold_calc: float  # Raw calculated threshold (before MIN floor)
+    
+    # Theoretical pricing (Black-Scholes)
+    strike_price: Optional[float] = None  # BTC open at hour start
+    volatility: Optional[float] = None  # Annualized volatility (cached)
+    minutes_remaining: Optional[float] = None  # Time to expiry
+    theo_up: Optional[float] = None  # Theoretical UP price
+    theo_down: Optional[float] = None  # Theoretical DOWN price
     
     # Initial prices at T=0
     up_ask_0: Optional[float] = None
@@ -131,6 +147,10 @@ class FrontrunStrategy:
         # Market refresh tracking
         self.current_hour: int = datetime.now(timezone.utc).hour
         self.needs_reconnect: bool = False
+        
+        # Pricing cache (updated async to avoid latency)
+        self.strike_price: Optional[float] = None  # Updated on hour change
+        self.cached_volatility: float = 0.30  # Default 30% until first calculation
     
     def _open_csv(self):
         """Open CSV file for writing signals (line-buffered for Docker)"""
@@ -243,9 +263,130 @@ class FrontrunStrategy:
                 logger.error(f"Threshold update error: {e}")
                 await asyncio.sleep(1)
     
+    # ============== PRICING METHODS ==============
+    
+    def _update_strike_price(self):
+        """Fetch strike price (BTC open at hour start) - called on hour change"""
+        try:
+            now = datetime.now(timezone.utc)
+            hour_start = now.replace(minute=0, second=0, microsecond=0)
+            timestamp_ms = int(hour_start.timestamp() * 1000)
+            
+            params = {
+                "symbol": "BTCUSDT",
+                "interval": "1h",
+                "startTime": timestamp_ms,
+                "limit": 1
+            }
+            
+            response = requests.get(BINANCE_KLINES_URL, params=params, timeout=5)
+            candles = response.json()
+            
+            if candles and len(candles) > 0:
+                self.strike_price = float(candles[0][1])  # Open price
+                logger.warning(f"Strike price updated: ${self.strike_price:,.2f}")
+        except Exception as e:
+            logger.error(f"Failed to update strike price: {e}")
+    
+    def _update_volatility(self):
+        """Calculate EWMA volatility from 1-min candles (λ=0.97)"""
+        try:
+            lookback_minutes = int(VOLATILITY_LOOKBACK_HOURS * 60)
+            
+            params = {
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "limit": lookback_minutes
+            }
+            
+            response = requests.get(BINANCE_KLINES_URL, params=params, timeout=10)
+            candles = response.json()
+            
+            if len(candles) < 10:
+                return
+            
+            # Calculate log returns from close prices
+            closes = [float(c[4]) for c in candles]
+            returns = []
+            
+            for i in range(1, len(closes)):
+                if closes[i-1] > 0:
+                    returns.append(math.log(closes[i] / closes[i-1]))
+            
+            if len(returns) < 10:
+                return
+            
+            # EWMA variance: σ²_t = λ * σ²_{t-1} + (1-λ) * r²_t
+            # Initialize with first return squared
+            ewma_variance = returns[0] ** 2
+            
+            for r in returns[1:]:
+                ewma_variance = EWMA_LAMBDA * ewma_variance + (1 - EWMA_LAMBDA) * (r ** 2)
+            
+            std_1min = math.sqrt(ewma_variance)
+            
+            # Annualize
+            self.cached_volatility = std_1min * math.sqrt(MINUTES_PER_YEAR)
+            logger.warning(f"Volatility EWMA(lambda={EWMA_LAMBDA}): {self.cached_volatility * 100:.1f}% annualized")
+            
+        except Exception as e:
+            logger.error(f"Failed to update volatility: {e}")
+    
+    @staticmethod
+    def _norm_cdf(x: float) -> float:
+        """Standard normal CDF (Abramowitz-Stegun approximation)"""
+        a1, a2, a3, a4, a5 = 0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429
+        p = 0.3275911
+        sign = 1 if x >= 0 else -1
+        x = abs(x)
+        t = 1.0 / (1.0 + p * x)
+        y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * math.exp(-x * x / 2)
+        return 0.5 * (1.0 + sign * y)
+    
+    def _calculate_theo_prices(self, spot_price: float) -> tuple:
+        """Calculate theoretical UP/DOWN prices using cached strike and volatility"""
+        if self.strike_price is None or self.cached_volatility <= 0:
+            return (None, None)
+        
+        now = datetime.now(timezone.utc)
+        minutes_remaining = 60 - now.minute - now.second / 60
+        
+        if minutes_remaining <= 0:
+            return (1.0, 0.0) if spot_price > self.strike_price else (0.0, 1.0)
+        
+        T = minutes_remaining / MINUTES_PER_YEAR
+        sqrt_T = math.sqrt(T)
+        
+        d2 = (math.log(spot_price / self.strike_price) - (self.cached_volatility ** 2) * T / 2) / (self.cached_volatility * sqrt_T)
+        
+        price_up = self._norm_cdf(d2)
+        price_down = 1.0 - price_up
+        
+        return (round(price_up, 4), round(price_down, 4), round(minutes_remaining, 2))
+    
+    async def _volatility_update_loop(self):
+        """Update volatility every 60 seconds in background"""
+        # Initial update
+        self._update_strike_price()
+        self._update_volatility()
+        
+        while self.running:
+            try:
+                await asyncio.sleep(VOLATILITY_UPDATE_INTERVAL)
+                self._update_volatility()
+            except Exception as e:
+                logger.error(f"Volatility update error: {e}")
+                await asyncio.sleep(VOLATILITY_UPDATE_INTERVAL)
+    
     def _create_signal(self, timestamp_ms: int, direction: str, qty: float, count: int, price: float):
         """Create new signal and start tracking"""
         self.signal_counter += 1
+        
+        # Calculate theoretical prices (uses cached strike/volatility - no latency)
+        theo_result = self._calculate_theo_prices(price)
+        theo_up, theo_down, mins_remaining = (None, None, None)
+        if theo_result and len(theo_result) == 3:
+            theo_up, theo_down, mins_remaining = theo_result
         
         signal = Signal(
             signal_id=self.signal_counter,
@@ -257,6 +398,11 @@ class FrontrunStrategy:
             binance_price=price,
             threshold_used=self.current_threshold,
             dynamic_threshold_calc=self.dynamic_threshold_calc,
+            strike_price=self.strike_price,
+            volatility=self.cached_volatility,
+            minutes_remaining=mins_remaining,
+            theo_up=theo_up,
+            theo_down=theo_down,
             up_ask_0=self.up_ask,
             up_bid_0=self.up_bid,
             down_ask_0=self.down_ask,
@@ -264,7 +410,7 @@ class FrontrunStrategy:
         )
         
         self.active_signals[self.signal_counter] = signal
-        logger.warning(f"SIGNAL #{self.signal_counter}: {direction} {qty:.4f} BTC @ ${price:.2f}")
+        logger.warning(f"SIGNAL #{self.signal_counter}: {direction} {qty:.4f} BTC @ ${price:.2f} | Theo: UP={theo_up} DOWN={theo_down}")
     
     def _update_signal_prices(self):
         """Update price evolution for active signals"""
@@ -449,6 +595,9 @@ class FrontrunStrategy:
                         self.down_token_id = new_down
                         logger.warning(f"New tokens: UP={new_up[:16]}... DOWN={new_down[:16]}...")
                         
+                        # Update strike price for new hour
+                        self._update_strike_price()
+                        
                         # Signal WebSocket to reconnect
                         self.needs_reconnect = True
                     except Exception as e:
@@ -474,7 +623,8 @@ class FrontrunStrategy:
             asyncio.create_task(self._polymarket_ws_loop()),
             asyncio.create_task(self._tracker_loop()),
             asyncio.create_task(self._market_refresh_loop()),
-            asyncio.create_task(self._threshold_update_loop())
+            asyncio.create_task(self._threshold_update_loop()),
+            asyncio.create_task(self._volatility_update_loop())
         ]
         
         try:
