@@ -43,7 +43,7 @@ TRACK_INTERVAL_MS = 500  # Record every 500ms
 
 # Dynamic threshold configuration
 MIN_THRESHOLD_BTC = float(os.environ.get('MIN_THRESHOLD_BTC', '5.0'))  # Floor minimum
-STD_MULTIPLIER = float(os.environ.get('STD_MULTIPLIER', '3.0'))  # Multiplier for std dev
+STD_MULTIPLIER = float(os.environ.get('STD_MULTIPLIER', '5.0'))  # Multiplier for std dev (5 sigma)
 LOOKBACK_MS = int(os.environ.get('LOOKBACK_MS', '600000'))  # 5 minutes in ms
 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
@@ -82,8 +82,10 @@ class Signal:
     down_ask_0: Optional[float] = None
     down_bid_0: Optional[float] = None
     
-    # Prices at each interval (500ms, 1000ms, etc.)
+    # Prices at each interval (250ms, 500ms, 750ms, 1000ms, etc.)
+    up_ask_250: Optional[float] = None
     up_ask_500: Optional[float] = None
+    up_ask_750: Optional[float] = None
     up_ask_1000: Optional[float] = None
     up_ask_1500: Optional[float] = None
     up_ask_2000: Optional[float] = None
@@ -94,7 +96,9 @@ class Signal:
     up_ask_4500: Optional[float] = None
     up_ask_5000: Optional[float] = None
     
+    down_ask_250: Optional[float] = None
     down_ask_500: Optional[float] = None
+    down_ask_750: Optional[float] = None
     down_ask_1000: Optional[float] = None
     down_ask_1500: Optional[float] = None
     down_ask_2000: Optional[float] = None
@@ -424,9 +428,15 @@ class FrontrunStrategy:
             elapsed = now_ms - signal.timestamp_ms
             
             # Update prices at each interval
+            if elapsed >= 250 and signal.up_ask_250 is None:
+                signal.up_ask_250 = self.up_ask
+                signal.down_ask_250 = self.down_ask
             if elapsed >= 500 and signal.up_ask_500 is None:
                 signal.up_ask_500 = self.up_ask
                 signal.down_ask_500 = self.down_ask
+            if elapsed >= 750 and signal.up_ask_750 is None:
+                signal.up_ask_750 = self.up_ask
+                signal.down_ask_750 = self.down_ask
             if elapsed >= 1000 and signal.up_ask_1000 is None:
                 signal.up_ask_1000 = self.up_ask
                 signal.down_ask_1000 = self.down_ask
