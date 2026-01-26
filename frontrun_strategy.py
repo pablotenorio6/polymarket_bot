@@ -99,9 +99,9 @@ class FrontrunStrategy:
         self.down_bid: Optional[float] = None
         self.down_ask: Optional[float] = None
         
-        # Binance trades buffer (for 100ms aggregation)
+        # Binance trades buffer (rolling window)
         self.trade_buffer: deque = deque()
-        self.last_bucket_ms: int = 0
+        self.last_signal_ms: int = 0  # Cooldown to avoid duplicate signals
         
         # Active signals being tracked
         self.active_signals: Dict[int, Signal] = {}
@@ -136,9 +136,8 @@ class FrontrunStrategy:
             self.signals_written += 1
     
     def _process_binance_trade(self, data: dict):
-        """Process Binance aggTrade - optimized for speed"""
+        """Process Binance aggTrade with rolling window detection"""
         now_ms = int(time.time() * 1000)
-        qty = float(data.get('p', 0)) and float(data.get('q', 0))
         
         trade = {
             'qty': float(data.get('q', 0)),
@@ -150,41 +149,36 @@ class FrontrunStrategy:
         # Add to buffer
         self.trade_buffer.append(trade)
         
-        # Calculate current bucket
-        current_bucket = (now_ms // AGG_WINDOW_MS) * AGG_WINDOW_MS
+        # Clean old trades outside the rolling window
+        cutoff = now_ms - AGG_WINDOW_MS
+        while self.trade_buffer and self.trade_buffer[0]['time_ms'] < cutoff:
+            self.trade_buffer.popleft()
         
-        # Check if we've moved to a new bucket
-        if current_bucket > self.last_bucket_ms:
-            self._check_signal(self.last_bucket_ms)
-            self.last_bucket_ms = current_bucket
-            
-            # Clean old trades from buffer (keep only current bucket)
-            cutoff = current_bucket - AGG_WINDOW_MS
-            while self.trade_buffer and self.trade_buffer[0]['time_ms'] < cutoff:
-                self.trade_buffer.popleft()
+        # Check for signal on every trade (rolling window)
+        self._check_signal(now_ms)
     
-    def _check_signal(self, bucket_ms: int):
-        """Check if NET directional volume in bucket exceeds threshold"""
+    def _check_signal(self, now_ms: int):
+        """Check if NET directional volume in rolling window exceeds threshold"""
         if not self.trade_buffer:
             return
         
-        # Sum trades in this bucket
+        # Cooldown: don't fire multiple signals within the same window
+        if now_ms - self.last_signal_ms < AGG_WINDOW_MS:
+            return
+        
+        # Sum all trades in the rolling window
         trade_count = 0
         last_price = 0.0
         buy_qty = 0.0
         sell_qty = 0.0
         
-        bucket_start = bucket_ms
-        bucket_end = bucket_ms + AGG_WINDOW_MS
-        
         for trade in self.trade_buffer:
-            if bucket_start <= trade['time_ms'] < bucket_end:
-                trade_count += 1
-                last_price = trade['price']
-                if trade['is_buyer_maker']:
-                    sell_qty += trade['qty']
-                else:
-                    buy_qty += trade['qty']
+            trade_count += 1
+            last_price = trade['price']
+            if trade['is_buyer_maker']:
+                sell_qty += trade['qty']
+            else:
+                buy_qty += trade['qty']
         
         # Calculate net directional volume
         net_volume = abs(buy_qty - sell_qty)
@@ -192,7 +186,8 @@ class FrontrunStrategy:
         # Check threshold on NET volume (directional imbalance)
         if net_volume >= THRESHOLD_BTC:
             direction = 'SELL' if sell_qty > buy_qty else 'BUY'
-            self._create_signal(bucket_ms, direction, net_volume, trade_count, last_price)
+            self.last_signal_ms = now_ms  # Set cooldown
+            self._create_signal(now_ms, direction, net_volume, trade_count, last_price)
     
     def _create_signal(self, timestamp_ms: int, direction: str, qty: float, count: int, price: float):
         """Create new signal and start tracking"""
