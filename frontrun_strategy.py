@@ -55,7 +55,8 @@ class Signal:
     total_qty_btc: float
     trade_count: int
     binance_price: float
-    threshold_used: float  # Dynamic threshold at signal time
+    threshold_used: float  # Dynamic threshold at signal time (with MIN floor)
+    dynamic_threshold_calc: float  # Raw calculated threshold (before MIN floor)
     
     # Initial prices at T=0
     up_ask_0: Optional[float] = None
@@ -116,6 +117,7 @@ class FrontrunStrategy:
         self.current_window_ms: int = 0
         self.current_window_max_vol: float = 0.0
         self.current_threshold: float = MIN_THRESHOLD_BTC
+        self.dynamic_threshold_calc: float = MIN_THRESHOLD_BTC  # Raw calculated value
         
         # Active signals being tracked
         self.active_signals: Dict[int, Signal] = {}
@@ -231,6 +233,7 @@ class FrontrunStrategy:
                         std_vol = 0
                     
                     dynamic_threshold = mean_vol + STD_MULTIPLIER * std_vol
+                    self.dynamic_threshold_calc = dynamic_threshold  # Store raw calculated value
                     self.current_threshold = max(MIN_THRESHOLD_BTC, dynamic_threshold)
                     
                     # logger.warning(f"Threshold: {self.current_threshold:.2f} BTC (calc: {dynamic_threshold:.2f}, mean: {mean_vol:.2f}, std: {std_vol:.2f}, samples: {len(volumes)})")
@@ -253,6 +256,7 @@ class FrontrunStrategy:
             trade_count=count,
             binance_price=price,
             threshold_used=self.current_threshold,
+            dynamic_threshold_calc=self.dynamic_threshold_calc,
             up_ask_0=self.up_ask,
             up_bid_0=self.up_bid,
             down_ask_0=self.down_ask,
