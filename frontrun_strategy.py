@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.WARNING, format='%(asctime)s|%(levelname)s|%(m
 logger = logging.getLogger(__name__)
 
 # ============== CONFIGURATION ==============
-THRESHOLD_BTC = float(os.environ.get('THRESHOLD_BTC', '1.0'))
+THRESHOLD_BTC = float(os.environ.get('THRESHOLD_BTC', '5.0'))
 AGG_WINDOW_MS = 100  # Aggregate trades in 100ms windows
 TRACK_DURATION_MS = 5000  # Track prices for 5 seconds after signal
 TRACK_INTERVAL_MS = 500  # Record every 500ms
@@ -164,12 +164,11 @@ class FrontrunStrategy:
                 self.trade_buffer.popleft()
     
     def _check_signal(self, bucket_ms: int):
-        """Check if trades in bucket exceed threshold"""
+        """Check if NET directional volume in bucket exceeds threshold"""
         if not self.trade_buffer:
             return
         
         # Sum trades in this bucket
-        total_qty = 0.0
         trade_count = 0
         last_price = 0.0
         buy_qty = 0.0
@@ -180,7 +179,6 @@ class FrontrunStrategy:
         
         for trade in self.trade_buffer:
             if bucket_start <= trade['time_ms'] < bucket_end:
-                total_qty += trade['qty']
                 trade_count += 1
                 last_price = trade['price']
                 if trade['is_buyer_maker']:
@@ -188,10 +186,13 @@ class FrontrunStrategy:
                 else:
                     buy_qty += trade['qty']
         
-        # Check threshold
-        if total_qty >= THRESHOLD_BTC:
+        # Calculate net directional volume
+        net_volume = abs(buy_qty - sell_qty)
+        
+        # Check threshold on NET volume (directional imbalance)
+        if net_volume >= THRESHOLD_BTC:
             direction = 'SELL' if sell_qty > buy_qty else 'BUY'
-            self._create_signal(bucket_ms, direction, total_qty, trade_count, last_price)
+            self._create_signal(bucket_ms, direction, net_volume, trade_count, last_price)
     
     def _create_signal(self, timestamp_ms: int, direction: str, qty: float, count: int, price: float):
         """Create new signal and start tracking"""
