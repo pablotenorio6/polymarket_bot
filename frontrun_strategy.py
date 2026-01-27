@@ -42,9 +42,9 @@ TRACK_DURATION_MS = 5000  # Track prices for 5 seconds after signal
 TRACK_INTERVAL_MS = 500  # Record every 500ms
 
 # Dynamic threshold configuration
-MIN_THRESHOLD_BTC = float(os.environ.get('MIN_THRESHOLD_BTC', '5.0'))  # Floor minimum
-STD_MULTIPLIER = float(os.environ.get('STD_MULTIPLIER', '5.0'))  # Multiplier for std dev (5 sigma)
-LOOKBACK_MS = int(os.environ.get('LOOKBACK_MS', '600000'))  # 5 minutes in ms
+MIN_THRESHOLD_BTC = float(os.environ.get('MIN_THRESHOLD_BTC', '2'))  # Floor minimum
+PERCENTILE_THRESHOLD = float(os.environ.get('PERCENTILE_THRESHOLD', '99.9'))  # Percentile (~50 signals/hour from 36k buckets)
+LOOKBACK_MS = int(os.environ.get('LOOKBACK_MS', '600000'))  # 3 minutes in ms
 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -135,9 +135,9 @@ class FrontrunStrategy:
         self.last_price: float = 0.0  # Last trade price
         
         # Dynamic threshold tracking (updated async every 1s)
-        self.volume_history: deque = deque()  # (window_ms, max_net_volume) per 100ms window
+        self.volume_history: deque = deque()  # (window_ms, gross_volume) per 100ms window
         self.current_window_ms: int = 0
-        self.current_window_max_vol: float = 0.0
+        self.current_window_total_vol: float = 0.0
         self.current_threshold: float = MIN_THRESHOLD_BTC
         self.dynamic_threshold_calc: float = MIN_THRESHOLD_BTC  # Raw calculated value
         
@@ -214,17 +214,19 @@ class FrontrunStrategy:
         # Calculate net volume from incremental sums (O(1))
         net_volume = abs(self.buy_qty_sum - self.sell_qty_sum)
         
-        # Track max volume per 100ms window for threshold calculation
+        # Track GROSS volume per 100ms window for threshold calculation
+        # (using net volume gives near-zero median since buys/sells cancel out)
+        gross_volume = self.buy_qty_sum + self.sell_qty_sum
         window_ms = (now_ms // AGG_WINDOW_MS) * AGG_WINDOW_MS
         if window_ms != self.current_window_ms:
-            # New window - save previous window's max if significant
-            if self.current_window_ms > 0 and self.current_window_max_vol > 0:
-                self.volume_history.append((self.current_window_ms, self.current_window_max_vol))
+            # New window - save previous window's gross volume if significant
+            if self.current_window_ms > 0 and self.current_window_total_vol > 0:
+                self.volume_history.append((self.current_window_ms, self.current_window_total_vol))
             self.current_window_ms = window_ms
-            self.current_window_max_vol = net_volume
+            self.current_window_total_vol = gross_volume
         else:
-            # Same window - track max
-            self.current_window_max_vol = max(self.current_window_max_vol, net_volume)
+            # Same window - update with current gross volume
+            self.current_window_total_vol = gross_volume
         
         # Cooldown: don't fire multiple signals within the same window
         if now_ms - self.last_signal_ms < AGG_WINDOW_MS:
@@ -237,7 +239,7 @@ class FrontrunStrategy:
             self._create_signal(now_ms, direction, net_volume, len(self.trade_buffer), self.last_price)
     
     async def _threshold_update_loop(self):
-        """Async loop to recalculate dynamic threshold every second"""
+        """Async loop to recalculate dynamic threshold every second using MAD (robust to outliers)"""
         while self.running:
             try:
                 now_ms = int(time.time() * 1000)
@@ -249,20 +251,24 @@ class FrontrunStrategy:
                 
                 # Recalculate threshold if we have enough data
                 if len(self.volume_history) >= 10:
-                    volumes = [v for _, v in self.volume_history]
-                    mean_vol = sum(volumes) / len(volumes)
+                    volumes = sorted([v for _, v in self.volume_history])
+                    n = len(volumes)
                     
-                    if len(volumes) > 1:
-                        variance = sum((v - mean_vol) ** 2 for v in volumes) / len(volumes)
-                        std_vol = variance ** 0.5
-                    else:
-                        std_vol = 0
+                    # Calculate percentile threshold
+                    # percentile_index = (P/100) * (n-1), then interpolate
+                    p_idx = (PERCENTILE_THRESHOLD / 100) * (n - 1)
+                    lower_idx = int(p_idx)
+                    upper_idx = min(lower_idx + 1, n - 1)
+                    fraction = p_idx - lower_idx
                     
-                    dynamic_threshold = mean_vol + STD_MULTIPLIER * std_vol
+                    dynamic_threshold = volumes[lower_idx] + fraction * (volumes[upper_idx] - volumes[lower_idx])
                     self.dynamic_threshold_calc = dynamic_threshold  # Store raw calculated value
                     self.current_threshold = max(MIN_THRESHOLD_BTC, dynamic_threshold)
                     
-                    # logger.warning(f"Threshold: {self.current_threshold:.2f} BTC (calc: {dynamic_threshold:.2f}, mean: {mean_vol:.2f}, std: {std_vol:.2f}, samples: {len(volumes)})")
+                    # Also log median and max for reference
+                    median_vol = volumes[n // 2]
+                    max_vol = volumes[-1]
+                    # logger.warning(f"Threshold: {self.current_threshold:.2f} BTC (p{PERCENTILE_THRESHOLD:.0f}: {dynamic_threshold:.2f}, median: {median_vol:.2f}, max: {max_vol:.2f}, samples: {n})")
                 
                 await asyncio.sleep(1)  # Update every 1 second
             except Exception as e:
@@ -624,7 +630,7 @@ class FrontrunStrategy:
     
     async def run(self):
         """Run the strategy"""
-        logger.warning(f"Starting Frontrun Strategy | Dynamic Threshold: min={MIN_THRESHOLD_BTC} BTC, multiplier={STD_MULTIPLIER}x std, lookback={LOOKBACK_MS/1000:.0f}s")
+        logger.warning(f"Starting Frontrun Strategy | Dynamic Threshold: min={MIN_THRESHOLD_BTC} BTC, percentile={PERCENTILE_THRESHOLD}, lookback={LOOKBACK_MS/1000:.0f}s")
         logger.warning(f"UP Token: {self.up_token_id[:20]}...")
         logger.warning(f"DOWN Token: {self.down_token_id[:20]}...")
         
