@@ -420,9 +420,10 @@ class FrontrunStrategy:
             if signal_id in self.active_positions:
                 old_shares = self.active_positions[signal_id]['shares']
                 self.active_positions[signal_id]['shares'] = size
-                logger.info(f"FILL #{signal_id} | WS confirmed: {old_shares:.2f} -> {size:.2f} shares")
+                self.active_positions[signal_id]['shares_source'] = 'ws_fill'  # Debug
+                logger.warning(f"FILL #{signal_id} | WS confirmed: {old_shares:.2f} -> {size:.2f} shares")
     
-    def _execute_buy_order(self, signal_id: int, token_id: str, side: str, bid_price: float):
+    def _execute_buy_order(self, signal_id: int, token_id: str, side: str, bid_price: float, signal_time_ms: int):
         """Execute buy order in background thread - LATENCY CRITICAL"""
         try:
             # Price = bid + 0.01 (aggressive to get filled)
@@ -449,18 +450,18 @@ class FrontrunStrategy:
             status = result.get('status', '').upper() if result else ''
             
             if status in ['MATCHED', 'FILLED']:
-                fill_time = time.time() * 1000
-                
                 # Track position (shares is estimate until WS fill updates it)
+                # EXIT_DELAY starts from SIGNAL time, not order fill time
                 self.active_positions[signal_id] = {
                     'token_id': token_id,
                     'side': side,
                     'shares': shares_estimate,
+                    'shares_source': 'estimate',  # Debug: track where shares came from
                     'entry_price': limit_price,
-                    'fill_time_ms': fill_time,
-                    'exit_time_ms': fill_time + EXIT_DELAY_MS
+                    'fill_time_ms': time.time() * 1000,
+                    'exit_time_ms': signal_time_ms + EXIT_DELAY_MS  # From signal, not fill
                 }
-                logger.warning(f"BUY #{signal_id} | {side.upper()} ${usd_amount}@{limit_price} | {exec_ms:.0f}ms")
+                logger.warning(f"BUY #{signal_id} | {side.upper()} ${usd_amount}@{limit_price} ~{shares_estimate:.2f}sh | {exec_ms:.0f}ms")
             else:
                 # Remove from pending if order failed
                 if signal_id in self.pending_buy_fills.get(token_id, []):
@@ -516,18 +517,19 @@ class FrontrunStrategy:
             
             # BUY signal on Binance -> price going UP -> buy UP token
             # SELL signal on Binance -> price going DOWN -> buy DOWN token
+            # Pass signal timestamp for exit_time calculation
             if direction == 'BUY' and self.up_bid:
                 # Check price range (0.14-0.86)
                 if not (0.14 <= self.up_bid <= 0.86):
                     logger.warning(f"SKIP #{self.signal_counter}: UP price {self.up_bid} outside range")
                     return
-                self.executor.submit(self._execute_buy_order, self.signal_counter, self.up_token_id, 'up', self.up_bid)
+                self.executor.submit(self._execute_buy_order, self.signal_counter, self.up_token_id, 'up', self.up_bid, timestamp_ms)
             elif direction == 'SELL' and self.down_bid:
                 # Check price range (0.14-0.86)
                 if not (0.14 <= self.down_bid <= 0.86):
                     logger.warning(f"SKIP #{self.signal_counter}: DOWN price {self.down_bid} outside range")
                     return
-                self.executor.submit(self._execute_buy_order, self.signal_counter, self.down_token_id, 'down', self.down_bid)
+                self.executor.submit(self._execute_buy_order, self.signal_counter, self.down_token_id, 'down', self.down_bid, timestamp_ms)
     
     def _update_signal_prices(self):
         """Update price evolution for active signals"""
@@ -743,9 +745,13 @@ class FrontrunStrategy:
             token_id = position['token_id']
             side = position['side']
             entry_price = position['entry_price']
+            shares_source = position.get('shares_source', 'unknown')
             
             # Use shares from this specific position (updated by WS callback if available)
             shares = position['shares']
+            
+            # Debug: log where shares came from
+            logger.info(f"SELL #{signal_id} PREP | shares={shares:.4f} source={shares_source}")
             
             if shares <= 0:
                 logger.warning(f"SELL #{signal_id} SKIPPED | No shares to sell")
@@ -762,18 +768,21 @@ class FrontrunStrategy:
             exec_ms = time.time() * 1000 - start_ms
             
             # Check status (case-insensitive - API returns 'matched' not 'MATCHED')
+            # GTC can return: MATCHED/FILLED (instant) or LIVE (in orderbook)
             status = result.get('status', '').upper() if result else ''
             
-            if status in ['MATCHED', 'FILLED']:
+            if status in ['MATCHED', 'FILLED', 'LIVE']:
                 # Calculate P&L (using bid captured before sell)
+                # Note: LIVE means order is in book - for sell@0.01 it should fill instantly
+                status_note = " (LIVE)" if status == 'LIVE' else ""
                 if exit_price:
                     pnl = (exit_price - entry_price) * shares
                     pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-                    logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.2f} | {entry_price}->{exit_price} | {pnl_str} | {exec_ms:.0f}ms")
+                    logger.warning(f"SELL #{signal_id}{status_note} | {side.upper()} {shares:.2f}sh ({shares_source}) | {entry_price}->{exit_price} | {pnl_str} | {exec_ms:.0f}ms")
                 else:
-                    logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.2f} | {exec_ms:.0f}ms")
+                    logger.warning(f"SELL #{signal_id}{status_note} | {side.upper()} {shares:.2f}sh ({shares_source}) | {exec_ms:.0f}ms")
             else:
-                logger.warning(f"SELL #{signal_id} FAILED | {status or 'NO_RESULT'} | {exec_ms:.0f}ms")
+                logger.warning(f"SELL #{signal_id} FAILED | {status or 'NO_RESULT'} | shares={shares:.4f} | {exec_ms:.0f}ms")
                 
         except Exception as e:
             logger.error(f"SELL #{signal_id} ERROR: {e}")
