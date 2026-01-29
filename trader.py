@@ -679,8 +679,8 @@ class FastTrader:
                 fee_rate_bps=0
             )
             signed_order = self.client.create_order(order_args)
-            # FAK = Fill-And-Kill (like IOC), allows partial fills
-            return self.client.post_order(signed_order, OrderType.FAK)
+            # GTC at price 0.01 = effective market sell (fills at best bid)
+            return self.client.post_order(signed_order, OrderType.GTC)
         except Exception as e:
             logger.error(f"Fast sell failed: {e}")
             return None
