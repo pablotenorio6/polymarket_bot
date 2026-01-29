@@ -428,15 +428,33 @@ class FrontrunStrategy:
             
             if result and result.get('status') in ['MATCHED', 'FILLED']:
                 fill_time = time.time() * 1000
+                order_id = result.get('orderID')
+                actual_price = limit_price
+                actual_shares = shares
+                
+                # Try to get actual fill price and shares from order details
+                if order_id and self.trader.client:
+                    try:
+                        order_info = self.trader.client.get_order(order_id)
+                        if order_info:
+                            # Get actual execution price
+                            if order_info.get('price'):
+                                actual_price = float(order_info.get('price'))
+                            # Get actual shares filled (may differ due to fees)
+                            if order_info.get('size_matched'):
+                                actual_shares = float(order_info.get('size_matched'))
+                    except:
+                        pass
+                
                 self.active_positions[signal_id] = {
                     'token_id': token_id,
                     'side': side,
-                    'shares': shares,
-                    'entry_price': limit_price,
+                    'shares': actual_shares,
+                    'entry_price': actual_price,
                     'fill_time_ms': fill_time,
                     'exit_time_ms': fill_time + EXIT_DELAY_MS
                 }
-                logger.warning(f"BUY #{signal_id} | {side.upper()} {shares:.1f}@{limit_price} | {exec_ms:.0f}ms")
+                logger.warning(f"BUY #{signal_id} | {side.upper()} {actual_shares:.1f}@{actual_price} | {exec_ms:.0f}ms")
             else:
                 status = result.get('status', 'UNKNOWN') if result else 'NO_RESULT'
                 logger.warning(f"BUY #{signal_id} FAILED | {status} | {exec_ms:.0f}ms")
@@ -711,9 +729,6 @@ class FrontrunStrategy:
             shares = position['shares']
             entry_price = position['entry_price']
             
-            # Get current bid for P&L estimate
-            current_bid = self.up_bid if side == 'up' else self.down_bid
-            
             start_ms = time.time() * 1000
             
             # Market sell (FOK)
@@ -722,10 +737,30 @@ class FrontrunStrategy:
             exec_ms = time.time() * 1000 - start_ms
             
             if result:
-                # Estimate P&L (bid is what we'd get approximately)
-                pnl = (current_bid - entry_price) * shares if current_bid else 0
-                pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-                logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.1f} | {entry_price}->{current_bid} | {pnl_str} | {exec_ms:.0f}ms")
+                order_id = result.get('orderID')
+                exit_price = None
+                
+                # Try to get actual fill price from order details
+                if order_id and self.trader.client:
+                    try:
+                        order_info = self.trader.client.get_order(order_id)
+                        if order_info:
+                            # average_price or price from the order
+                            exit_price = float(order_info.get('price', 0)) or None
+                    except:
+                        pass
+                
+                # Fallback to current bid if we couldn't get real price
+                if not exit_price:
+                    exit_price = self.up_bid if side == 'up' else self.down_bid
+                
+                # Calculate P&L
+                if exit_price:
+                    pnl = (exit_price - entry_price) * shares
+                    pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+                    logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.1f} | {entry_price}->{exit_price} | {pnl_str} | {exec_ms:.0f}ms")
+                else:
+                    logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.1f} | {exec_ms:.0f}ms")
             else:
                 logger.warning(f"SELL #{signal_id} FAILED | {exec_ms:.0f}ms")
                 
