@@ -428,23 +428,11 @@ class FrontrunStrategy:
             
             if result and result.get('status') in ['MATCHED', 'FILLED']:
                 fill_time = time.time() * 1000
-                order_id = result.get('orderID')
-                actual_price = limit_price
-                actual_shares = shares
                 
-                # Try to get actual fill price and shares from order details
-                if order_id and self.trader.client:
-                    try:
-                        order_info = self.trader.client.get_order(order_id)
-                        if order_info:
-                            # Get actual execution price
-                            if order_info.get('price'):
-                                actual_price = float(order_info.get('price'))
-                            # Get actual shares filled (may differ due to fees)
-                            if order_info.get('size_matched'):
-                                actual_shares = float(order_info.get('size_matched'))
-                    except:
-                        pass
+                # Get actual fill data from trader.active_positions (already populated by place_buy_order via _get_filled_shares)
+                trader_pos = self.trader.active_positions.get(token_id, {})
+                actual_shares = trader_pos.get('shares', shares)
+                actual_price = trader_pos.get('entry_price', limit_price)
                 
                 self.active_positions[signal_id] = {
                     'token_id': token_id,
