@@ -19,9 +19,12 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field, asdict
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import websockets
 import requests
+
+from trader import FastTrader
 
 # Pricing constants
 VOLATILITY_UPDATE_INTERVAL = 60  # Update volatility every 30 seconds
@@ -45,6 +48,11 @@ TRACK_INTERVAL_MS = 500  # Record every 500ms
 MIN_THRESHOLD_BTC = float(os.environ.get('MIN_THRESHOLD_BTC', '2'))  # Floor minimum
 PERCENTILE_THRESHOLD = float(os.environ.get('PERCENTILE_THRESHOLD', '99.9'))  # Percentile (~50 signals/hour from 36k buckets)
 LOOKBACK_MS = int(os.environ.get('LOOKBACK_MS', '600000'))  # 3 minutes in ms
+
+# Trading configuration
+TRADING_ENABLED = os.environ.get('TRADING_ENABLED', 'false').lower() == 'true'
+POSITION_SIZE_USD = float(os.environ.get('POSITION_SIZE_USD', '10'))  # USD per trade
+EXIT_DELAY_MS = int(os.environ.get('EXIT_DELAY_MS', '4000'))  # 4 seconds exit delay
 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -157,6 +165,11 @@ class FrontrunStrategy:
         # Pricing cache (updated async to avoid latency)
         self.strike_price: Optional[float] = None  # Updated on hour change
         self.cached_volatility: float = 0.30  # Default 30% until first calculation
+        
+        # Trading execution
+        self.trader: Optional[FastTrader] = None
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trade_exec")
+        self.active_positions: Dict[int, Dict] = {}  # signal_id -> position info
     
     def _open_csv(self):
         """Open CSV file for writing signals (line-buffered for Docker)"""
@@ -391,6 +404,46 @@ class FrontrunStrategy:
                 logger.error(f"Volatility update error: {e}")
                 await asyncio.sleep(VOLATILITY_UPDATE_INTERVAL)
     
+    def _execute_buy_order(self, signal_id: int, token_id: str, side: str, bid_price: float):
+        """Execute buy order in background thread - LATENCY CRITICAL"""
+        try:
+            # Price = bid + 0.01 (aggressive to get filled)
+            limit_price = round(bid_price + 0.01, 2)
+            
+            # Calculate shares from USD size
+            shares = POSITION_SIZE_USD / limit_price if limit_price > 0 else 0
+            
+            start_ms = time.time() * 1000
+            
+            result = self.trader.place_buy_order(
+                token_id=token_id,
+                side=side,
+                price=limit_price,
+                size=shares,
+                market_info={},  # Not needed for FOK
+                order_type="FOK"
+            )
+            
+            exec_ms = time.time() * 1000 - start_ms
+            
+            if result and result.get('status') in ['MATCHED', 'FILLED']:
+                fill_time = time.time() * 1000
+                self.active_positions[signal_id] = {
+                    'token_id': token_id,
+                    'side': side,
+                    'shares': shares,
+                    'entry_price': limit_price,
+                    'fill_time_ms': fill_time,
+                    'exit_time_ms': fill_time + EXIT_DELAY_MS
+                }
+                logger.warning(f"BUY #{signal_id} | {side.upper()} {shares:.1f}@{limit_price} | {exec_ms:.0f}ms")
+            else:
+                status = result.get('status', 'UNKNOWN') if result else 'NO_RESULT'
+                logger.warning(f"BUY #{signal_id} FAILED | {status} | {exec_ms:.0f}ms")
+                
+        except Exception as e:
+            logger.error(f"BUY #{signal_id} ERROR: {e}")
+    
     def _create_signal(self, timestamp_ms: int, direction: str, qty: float, count: int, price: float):
         """Create new signal and start tracking"""
         self.signal_counter += 1
@@ -423,7 +476,29 @@ class FrontrunStrategy:
         )
         
         self.active_signals[self.signal_counter] = signal
-        logger.warning(f"SIGNAL #{self.signal_counter}: {direction} {qty:.4f} BTC @ ${price:.2f} | Theo: UP={theo_up} DOWN={theo_down}")
+        # logger.warning(f"SIGNAL #{self.signal_counter}: {direction} {qty:.4f} BTC @ ${price:.2f} | Theo: UP={theo_up} DOWN={theo_down}")
+        
+        # === EXECUTE TRADE (non-blocking) ===
+        if TRADING_ENABLED and self.trader:
+            # Check time window: only trade between 50-3 minutes remaining
+            if mins_remaining is None or not (3 <= mins_remaining <= 50):
+                logger.warning(f"SKIP #{self.signal_counter}: Outside time window (mins={mins_remaining})")
+                return
+            
+            # BUY signal on Binance -> price going UP -> buy UP token
+            # SELL signal on Binance -> price going DOWN -> buy DOWN token
+            if direction == 'BUY' and self.up_bid:
+                # Check price range (0.14-0.86)
+                if not (0.14 <= self.up_bid <= 0.86):
+                    logger.warning(f"SKIP #{self.signal_counter}: UP price {self.up_bid} outside range")
+                    return
+                self.executor.submit(self._execute_buy_order, self.signal_counter, self.up_token_id, 'up', self.up_bid)
+            elif direction == 'SELL' and self.down_bid:
+                # Check price range (0.14-0.86)
+                if not (0.14 <= self.down_bid <= 0.86):
+                    logger.warning(f"SKIP #{self.signal_counter}: DOWN price {self.down_bid} outside range")
+                    return
+                self.executor.submit(self._execute_buy_order, self.signal_counter, self.down_token_id, 'down', self.down_bid)
     
     def _update_signal_prices(self):
         """Update price evolution for active signals"""
@@ -628,11 +703,68 @@ class FrontrunStrategy:
                 logger.error(f"Market refresh error: {e}")
                 await asyncio.sleep(10)
     
+    def _execute_sell_order(self, signal_id: int, position: Dict):
+        """Execute sell order in background thread"""
+        try:
+            token_id = position['token_id']
+            side = position['side']
+            shares = position['shares']
+            entry_price = position['entry_price']
+            
+            # Get current bid for P&L estimate
+            current_bid = self.up_bid if side == 'up' else self.down_bid
+            
+            start_ms = time.time() * 1000
+            
+            # Market sell (FOK)
+            result = self.trader.place_market_sell_order(token_id, shares)
+            
+            exec_ms = time.time() * 1000 - start_ms
+            
+            if result:
+                # Estimate P&L (bid is what we'd get approximately)
+                pnl = (current_bid - entry_price) * shares if current_bid else 0
+                pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+                logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.1f} | {entry_price}->{current_bid} | {pnl_str} | {exec_ms:.0f}ms")
+            else:
+                logger.warning(f"SELL #{signal_id} FAILED | {exec_ms:.0f}ms")
+                
+        except Exception as e:
+            logger.error(f"SELL #{signal_id} ERROR: {e}")
+    
+    async def _position_manager_loop(self):
+        """Check positions and exit after EXIT_DELAY_MS"""
+        while self.running:
+            try:
+                now_ms = time.time() * 1000
+                to_close = []
+                
+                for signal_id, pos in self.active_positions.items():
+                    if now_ms >= pos['exit_time_ms']:
+                        to_close.append(signal_id)
+                
+                # Execute sells in background
+                for signal_id in to_close:
+                    pos = self.active_positions.pop(signal_id)
+                    self.executor.submit(self._execute_sell_order, signal_id, pos)
+                
+                await asyncio.sleep(0.1)  # Check every 100ms
+            except Exception as e:
+                logger.error(f"Position manager error: {e}")
+                await asyncio.sleep(0.1)
+    
     async def run(self):
         """Run the strategy"""
         logger.warning(f"Starting Frontrun Strategy | Dynamic Threshold: min={MIN_THRESHOLD_BTC} BTC, percentile={PERCENTILE_THRESHOLD}, lookback={LOOKBACK_MS/1000:.0f}s")
         logger.warning(f"UP Token: {self.up_token_id[:20]}...")
         logger.warning(f"DOWN Token: {self.down_token_id[:20]}...")
+        
+        # Initialize trader if enabled
+        if TRADING_ENABLED:
+            logger.warning(f"TRADING ENABLED: ${POSITION_SIZE_USD}/trade, exit after {EXIT_DELAY_MS}ms")
+            self.trader = FastTrader()
+        else:
+            logger.warning("TRADING DISABLED (simulation mode)")
         
         self._open_csv()
         self.running = True
@@ -646,6 +778,10 @@ class FrontrunStrategy:
             asyncio.create_task(self._volatility_update_loop())
         ]
         
+        # Add position manager if trading enabled
+        if TRADING_ENABLED:
+            tasks.append(asyncio.create_task(self._position_manager_loop()))
+        
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -656,6 +792,7 @@ class FrontrunStrategy:
                 t.cancel()
             if self.csv_file:
                 self.csv_file.close()
+            self.executor.shutdown(wait=False)
             logger.warning(f"Stopped. Signals written: {self.signals_written}")
 
 
