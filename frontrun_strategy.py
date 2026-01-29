@@ -445,7 +445,10 @@ class FrontrunStrategy:
             
             exec_ms = time.time() * 1000 - start_ms
             
-            if result and result.get('status') in ['MATCHED', 'FILLED']:
+            # Check status (case-insensitive - API returns 'matched' not 'MATCHED')
+            status = result.get('status', '').upper() if result else ''
+            
+            if status in ['MATCHED', 'FILLED']:
                 fill_time = time.time() * 1000
                 
                 # Track position (shares is estimate until WS fill updates it)
@@ -462,8 +465,7 @@ class FrontrunStrategy:
                 # Remove from pending if order failed
                 if signal_id in self.pending_buy_fills.get(token_id, []):
                     self.pending_buy_fills[token_id].remove(signal_id)
-                status = result.get('status', 'UNKNOWN') if result else 'NO_RESULT'
-                logger.warning(f"BUY #{signal_id} FAILED | {status} | {exec_ms:.0f}ms")
+                logger.warning(f"BUY #{signal_id} FAILED | {status or 'NO_RESULT'} | {exec_ms:.0f}ms")
                 
         except Exception as e:
             # Remove from pending on error
@@ -759,7 +761,10 @@ class FrontrunStrategy:
             
             exec_ms = time.time() * 1000 - start_ms
             
-            if result and result.get('status') in ['MATCHED', 'FILLED']:
+            # Check status (case-insensitive - API returns 'matched' not 'MATCHED')
+            status = result.get('status', '').upper() if result else ''
+            
+            if status in ['MATCHED', 'FILLED']:
                 # Calculate P&L (using bid captured before sell)
                 if exit_price:
                     pnl = (exit_price - entry_price) * shares
@@ -768,8 +773,7 @@ class FrontrunStrategy:
                 else:
                     logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.2f} | {exec_ms:.0f}ms")
             else:
-                status = result.get('status', 'UNKNOWN') if result else 'NO_RESULT'
-                logger.warning(f"SELL #{signal_id} FAILED | {status} | {exec_ms:.0f}ms")
+                logger.warning(f"SELL #{signal_id} FAILED | {status or 'NO_RESULT'} | {exec_ms:.0f}ms")
                 
         except Exception as e:
             logger.error(f"SELL #{signal_id} ERROR: {e}")
