@@ -25,6 +25,7 @@ import websockets
 import requests
 
 from trader import FastTrader
+from ws_monitor import WebSocketUserFillsTracker
 
 # Pricing constants
 VOLATILITY_UPDATE_INTERVAL = 60  # Update volatility every 30 seconds
@@ -124,9 +125,10 @@ class FrontrunStrategy:
     Auto-refreshes tokens when hourly market changes.
     """
     
-    def __init__(self, up_token_id: str, down_token_id: str):
+    def __init__(self, up_token_id: str, down_token_id: str, condition_id: str = ''):
         self.up_token_id = up_token_id
         self.down_token_id = down_token_id
+        self.condition_id = condition_id
         self.running = False
         
         # Current Polymarket state
@@ -168,8 +170,10 @@ class FrontrunStrategy:
         
         # Trading execution
         self.trader: Optional[FastTrader] = None
+        self.fills_tracker: Optional[WebSocketUserFillsTracker] = None
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trade_exec")
         self.active_positions: Dict[int, Dict] = {}  # signal_id -> position info
+        self.pending_buy_fills: Dict[str, List[int]] = {}  # token_id -> [signal_ids waiting for fill]
     
     def _open_csv(self):
         """Open CSV file for writing signals (line-buffered for Docker)"""
@@ -404,40 +408,67 @@ class FrontrunStrategy:
                 logger.error(f"Volatility update error: {e}")
                 await asyncio.sleep(VOLATILITY_UPDATE_INTERVAL)
     
+    def _on_fill_received(self, token_id: str, side: str, size: float):
+        """Callback when WS receives a fill - update the correct signal's shares"""
+        if side != 'BUY':
+            return  # Only track buy fills (sells are final)
+        
+        # Find the oldest pending signal for this token
+        pending = self.pending_buy_fills.get(token_id, [])
+        if pending:
+            signal_id = pending.pop(0)  # FIFO - oldest first
+            if signal_id in self.active_positions:
+                old_shares = self.active_positions[signal_id]['shares']
+                self.active_positions[signal_id]['shares'] = size
+                logger.info(f"FILL #{signal_id} | WS confirmed: {old_shares:.2f} -> {size:.2f} shares")
+    
     def _execute_buy_order(self, signal_id: int, token_id: str, side: str, bid_price: float):
         """Execute buy order in background thread - LATENCY CRITICAL"""
         try:
             # Price = bid + 0.01 (aggressive to get filled)
             limit_price = round(bid_price + 0.01, 2)
             
-            # Calculate shares from USD size (max 2 decimals for Polymarket)
-            shares = round(POSITION_SIZE_USD / limit_price, 2) if limit_price > 0 else 0
+            # Use USD amount directly (avoids decimal precision issues)
+            usd_amount = round(POSITION_SIZE_USD, 2)
+            # Estimate shares for logging/tracking
+            shares_estimate = usd_amount / limit_price if limit_price > 0 else 0
+            
+            # Register as pending fill BEFORE sending order
+            if token_id not in self.pending_buy_fills:
+                self.pending_buy_fills[token_id] = []
+            self.pending_buy_fills[token_id].append(signal_id)
             
             start_ms = time.time() * 1000
             
-            # Use fast method - no warmup, no order details query, no stop loss pre-sign
-            result = self.trader.place_buy_order_fast(token_id, limit_price, shares)
+            # Use fast method with USD amount (MarketOrderArgs)
+            result = self.trader.place_buy_order_fast(token_id, limit_price, usd_amount)
             
             exec_ms = time.time() * 1000 - start_ms
             
             if result and result.get('status') in ['MATCHED', 'FILLED']:
                 fill_time = time.time() * 1000
                 
-                # For fast orders, we use the limit price (actual fill price may be same or better)
+                # Track position (shares is estimate until WS fill updates it)
                 self.active_positions[signal_id] = {
                     'token_id': token_id,
                     'side': side,
-                    'shares': shares,
+                    'shares': shares_estimate,
                     'entry_price': limit_price,
                     'fill_time_ms': fill_time,
                     'exit_time_ms': fill_time + EXIT_DELAY_MS
                 }
-                logger.warning(f"BUY #{signal_id} | {side.upper()} {shares:.1f}@{limit_price} | {exec_ms:.0f}ms")
+                logger.warning(f"BUY #{signal_id} | {side.upper()} ${usd_amount}@{limit_price} | {exec_ms:.0f}ms")
             else:
+                # Remove from pending if order failed
+                if signal_id in self.pending_buy_fills.get(token_id, []):
+                    self.pending_buy_fills[token_id].remove(signal_id)
                 status = result.get('status', 'UNKNOWN') if result else 'NO_RESULT'
                 logger.warning(f"BUY #{signal_id} FAILED | {status} | {exec_ms:.0f}ms")
                 
         except Exception as e:
+            # Remove from pending on error
+            if token_id in self.pending_buy_fills and signal_id in self.pending_buy_fills[token_id]:
+                self.pending_buy_fills[token_id].remove(signal_id)
             logger.error(f"BUY #{signal_id} ERROR: {e}")
     
     def _create_signal(self, timestamp_ms: int, direction: str, qty: float, count: int, price: float):
@@ -680,13 +711,18 @@ class FrontrunStrategy:
                     
                     # Fetch new market tokens
                     try:
-                        new_up, new_down = await get_market_tokens()
+                        new_up, new_down, new_condition = await get_market_tokens()
                         self.up_token_id = new_up
                         self.down_token_id = new_down
+                        self.condition_id = new_condition
                         logger.warning(f"New tokens: UP={new_up[:16]}... DOWN={new_down[:16]}...")
                         
                         # Update strike price for new hour
                         self._update_strike_price()
+                        
+                        # Update fills tracker subscription for new market
+                        if self.fills_tracker and new_condition:
+                            await self.fills_tracker.add_condition_id(new_condition)
                         
                         # Signal WebSocket to reconnect
                         self.needs_reconnect = True
@@ -704,8 +740,14 @@ class FrontrunStrategy:
         try:
             token_id = position['token_id']
             side = position['side']
-            shares = position['shares']
             entry_price = position['entry_price']
+            
+            # Use shares from this specific position (updated by WS callback if available)
+            shares = position['shares']
+            
+            if shares <= 0:
+                logger.warning(f"SELL #{signal_id} SKIPPED | No shares to sell")
+                return
             
             # Get current bid BEFORE sell for P&L estimate
             exit_price = self.up_bid if side == 'up' else self.down_bid
@@ -722,9 +764,9 @@ class FrontrunStrategy:
                 if exit_price:
                     pnl = (exit_price - entry_price) * shares
                     pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-                    logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.1f} | {entry_price}->{exit_price} | {pnl_str} | {exec_ms:.0f}ms")
+                    logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.2f} | {entry_price}->{exit_price} | {pnl_str} | {exec_ms:.0f}ms")
                 else:
-                    logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.1f} | {exec_ms:.0f}ms")
+                    logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.2f} | {exec_ms:.0f}ms")
             else:
                 status = result.get('status', 'UNKNOWN') if result else 'NO_RESULT'
                 logger.warning(f"SELL #{signal_id} FAILED | {status} | {exec_ms:.0f}ms")
@@ -763,6 +805,16 @@ class FrontrunStrategy:
         if TRADING_ENABLED:
             logger.warning(f"TRADING ENABLED: ${POSITION_SIZE_USD}/trade, exit after {EXIT_DELAY_MS}ms")
             self.trader = FastTrader()
+            
+            # Initialize fills tracker for real-time position updates
+            if self.trader.client and self.condition_id:
+                self.fills_tracker = WebSocketUserFillsTracker(self.trader.client)
+                self.fills_tracker.on_fill = self._on_fill_received  # Register callback
+                if await self.fills_tracker.start([self.condition_id]):
+                    logger.warning(f"Fills tracker started for condition: {self.condition_id[:16]}...")
+                else:
+                    logger.warning("Fills tracker failed to start - using estimated shares")
+                    self.fills_tracker = None
         else:
             logger.warning("TRADING DISABLED (simulation mode)")
         
@@ -790,6 +842,8 @@ class FrontrunStrategy:
             self.running = False
             for t in tasks:
                 t.cancel()
+            if self.fills_tracker:
+                await self.fills_tracker.close()
             if self.csv_file:
                 self.csv_file.close()
             self.executor.shutdown(wait=False)
@@ -797,7 +851,7 @@ class FrontrunStrategy:
 
 
 async def get_market_tokens():
-    """Fetch current hourly BTC market token IDs"""
+    """Fetch current hourly BTC market token IDs and condition ID"""
     from monitor import FastMarketMonitor
     
     monitor = FastMarketMonitor(
@@ -820,24 +874,27 @@ async def get_market_tokens():
         if isinstance(outcomes, str):
             outcomes = json.loads(outcomes)
         
+        condition_id = market.get('conditionId', '')
+        
         up_idx = 0 if outcomes[0].lower() == 'up' else 1
         down_idx = 1 - up_idx
         
-        return clob_tokens[up_idx], clob_tokens[down_idx]
+        return clob_tokens[up_idx], clob_tokens[down_idx], condition_id
     finally:
         await monitor.close()
 
 
 async def main():
-    # Get token IDs
+    # Get token IDs and condition ID
     up_token = UP_TOKEN_ID
     down_token = DOWN_TOKEN_ID
+    condition_id = os.environ.get('CONDITION_ID', '')
     
     if not up_token or not down_token:
         logger.warning("Fetching market token IDs...")
-        up_token, down_token = await get_market_tokens()
+        up_token, down_token, condition_id = await get_market_tokens()
     
-    strategy = FrontrunStrategy(up_token, down_token)
+    strategy = FrontrunStrategy(up_token, down_token, condition_id)
     
     try:
         await strategy.run()

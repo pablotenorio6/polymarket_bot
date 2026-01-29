@@ -422,11 +422,18 @@ class FastTrader:
         self,
         token_id: str,
         price: float,
-        size: float
+        amount_usd: float
     ) -> Optional[Dict]:
         """
         FAST buy order for latency-critical strategies (frontrun).
+        Uses MarketOrderArgs (amount in USD) to avoid decimal precision issues.
+        Uses IOC (Immediate-Or-Cancel) to allow partial fills.
         Skips: warmup, order details query, stop loss pre-signing, position tracking.
+        
+        Args:
+            token_id: Token to buy
+            price: Maximum price willing to pay
+            amount_usd: Amount in USD to spend (NOT shares)
         
         Returns:
             Order response with 'status' and 'orderID', or None
@@ -435,15 +442,17 @@ class FastTrader:
             return None
         
         try:
-            order_args = OrderArgs(
+            # MarketOrderArgs uses 'amount' in USD for buys (max 2 decimals)
+            order_args = MarketOrderArgs(
                 token_id=token_id,
                 price=round(price, 2),
-                size=round(size, 2),  # Max 2 decimals for maker amount
+                amount=round(amount_usd, 2),  # USD to spend
                 side=BUY,
                 fee_rate_bps=0
             )
-            signed_order = self.client.create_order(order_args)
-            return self.client.post_order(signed_order, orderType=OrderType.FOK)
+            signed_order = self.client.create_market_order(order_args)
+            # FAK = Fill-And-Kill (like IOC), allows partial fills
+            return self.client.post_order(signed_order, orderType=OrderType.FAK)
         except Exception as e:
             logger.error(f"Fast buy failed: {e}")
             return None
@@ -652,6 +661,7 @@ class FastTrader:
         """
         FAST market sell for latency-critical strategies (frontrun).
         Sells at minimum price (0.01) for instant execution.
+        Uses FAK (Fill-And-Kill) to allow partial fills.
         Skips: logging, position tracking.
         
         Returns:
@@ -669,7 +679,8 @@ class FastTrader:
                 fee_rate_bps=0
             )
             signed_order = self.client.create_order(order_args)
-            return self.client.post_order(signed_order, OrderType.FOK)
+            # FAK = Fill-And-Kill (like IOC), allows partial fills
+            return self.client.post_order(signed_order, OrderType.FAK)
         except Exception as e:
             logger.error(f"Fast sell failed: {e}")
             return None

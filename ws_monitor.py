@@ -380,7 +380,7 @@ class WebSocketUserFillsTracker:
     
     __slots__ = (
         'client', 'ws', 'positions', 'connected', 'running',
-        'reconnect_delay', 'max_reconnect_delay', 'condition_ids'
+        'reconnect_delay', 'max_reconnect_delay', 'condition_ids', 'on_fill'
     )
     
     def __init__(self, clob_client):
@@ -398,6 +398,8 @@ class WebSocketUserFillsTracker:
         self.reconnect_delay = 1.0
         self.max_reconnect_delay = 30.0
         self.condition_ids: List[str] = []
+        # callback(token_id, side, size) - size is TOTAL for the order (multi-level fills aggregated)
+        self.on_fill: Optional[Callable[[str, str, float], None]] = None
     
     def _get_auth_message(self) -> Optional[Dict]:
         """Get authentication message using client's API credentials"""
@@ -551,6 +553,13 @@ class WebSocketUserFillsTracker:
         elif side == 'SELL':
             self.positions[asset_id] = max(0, current - size)
             logger.info(f"[WS FILL] SELL {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
+        
+        # Callback for external handling
+        if self.on_fill:
+            try:
+                self.on_fill(asset_id, side, size)
+            except Exception as e:
+                logger.debug(f"Fill callback error: {e}")
     
     def _handle_order(self, order: Dict):
         """Handle order placement/update/cancellation events"""
