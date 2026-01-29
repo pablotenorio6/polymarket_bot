@@ -751,7 +751,7 @@ class FrontrunStrategy:
             shares = position['shares']
             
             # Debug: log where shares came from
-            logger.info(f"SELL #{signal_id} PREP | shares={shares:.4f} source={shares_source}")
+            logger.warning(f"SELL #{signal_id} PREP | shares={shares:.4f} source={shares_source}")
             
             if shares <= 0:
                 logger.warning(f"SELL #{signal_id} SKIPPED | No shares to sell")
