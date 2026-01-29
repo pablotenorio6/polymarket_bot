@@ -418,6 +418,36 @@ class FastTrader:
         # SLOW PATH: Sell all tokens (queries actual balance from API)
         return self.sell_all_tokens(token_id)
     
+    def place_buy_order_fast(
+        self,
+        token_id: str,
+        price: float,
+        size: float
+    ) -> Optional[Dict]:
+        """
+        FAST buy order for latency-critical strategies (frontrun).
+        Skips: warmup, order details query, stop loss pre-signing, position tracking.
+        
+        Returns:
+            Order response with 'status' and 'orderID', or None
+        """
+        if not self.client:
+            return None
+        
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=round(price, 2),
+                size=round(size, 2),  # Max 2 decimals for maker amount
+                side=BUY,
+                fee_rate_bps=0
+            )
+            signed_order = self.client.create_order(order_args)
+            return self.client.post_order(signed_order, orderType=OrderType.FOK)
+        except Exception as e:
+            logger.error(f"Fast buy failed: {e}")
+            return None
+    
     def place_buy_order(
         self,
         token_id: str,
@@ -428,7 +458,7 @@ class FastTrader:
         order_type: str = "FOK"
     ) -> Optional[Dict]:
         """
-        Place a buy order with minimal latency
+        Place a buy order with position tracking (for main strategy).
         
         Args:
             token_id: Token to buy
@@ -477,36 +507,45 @@ class FastTrader:
                 status = result.get('status', 'N/A')
                 error_msg = result.get('errorMsg', '')
                 order_id = result.get('orderID', 'N/A')
-                logger.info(f"BUY ORDER RESPONSE: success={success}, status={status}, orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}...")
+                logger.debug(f"BUY ORDER RESPONSE: success={success}, status={status}, orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}...")
                 if error_msg:
-                    logger.warning(f"Order errorMsg: {error_msg}")
+                    logger.debug(f"Order errorMsg: {error_msg}")
                 
                 # For GTC orders, they go to orderbook and wait - don't track position yet
                 if order_type == "GTC":
                     if status == 'LIVE':
-                        logger.info(f"GTC ORDER LIVE: BUY {side.upper()} {size} @ ${price_rounded} - waiting in orderbook")
+                        logger.debug(f"GTC ORDER LIVE: BUY {side.upper()} {size} @ ${price_rounded} - waiting in orderbook")
                     elif status == 'MATCHED':
-                        logger.info(f"GTC ORDER MATCHED: BUY {side.upper()} {size} @ ${price_rounded}")
+                        logger.debug(f"GTC ORDER MATCHED: BUY {side.upper()} {size} @ ${price_rounded}")
                     return result
                 
                 # For FOK orders, track position if filled
-                # Get ACTUAL shares filled (may be less than requested due to maker fees)
-                actual_shares = size  # Default to requested size
+                # Get ACTUAL shares and price filled
+                actual_shares = size  # Default to requested
+                actual_price = price_rounded  # Default to limit price
                 if order_id and order_id != 'N/A':
-                    filled = self._get_filled_shares(order_id)
-                    if filled and filled > 0:
-                        actual_shares = filled
-                        if filled < size:
-                            logger.info(f"MAKER FEE: Requested {size} shares, received {actual_shares} shares (fee: {size - actual_shares:.4f})")
+                    try:
+                        order_info = self.client.get_order(order_id)
+                        if order_info:
+                            # Get actual shares filled
+                            if order_info.get('size_matched'):
+                                actual_shares = float(order_info.get('size_matched'))
+                                if actual_shares < size:
+                                    logger.debug(f"MAKER FEE: Requested {size} shares, received {actual_shares} shares")
+                            # Get actual execution price
+                            if order_info.get('price'):
+                                actual_price = float(order_info.get('price'))
+                    except Exception as e:
+                        logger.debug(f"Error getting order details: {e}")
                 
-                logger.info(f"ORDER FILLED: BUY {side.upper()} {actual_shares} @ ${price_rounded}")
+                logger.debug(f"ORDER FILLED: BUY {side.upper()} {actual_shares} @ ${actual_price}")
                 
-                # Track position with ACTUAL shares received (FOK only)
+                # Track position with ACTUAL shares and price
                 with self._position_lock:
                     self.active_positions[token_id] = {
                         'side': side,
-                        'shares': actual_shares,  # Use actual shares, not requested
-                        'entry_price': price_rounded,
+                        'shares': actual_shares,
+                        'entry_price': actual_price,
                         'entry_time': time.time(),
                         'market': market_info
                     }
@@ -605,6 +644,36 @@ class FastTrader:
             token_id, price, size, order_type
         )
     
+    def place_sell_order_fast(
+        self,
+        token_id: str,
+        size: float
+    ) -> Optional[Dict]:
+        """
+        FAST market sell for latency-critical strategies (frontrun).
+        Sells at minimum price (0.01) for instant execution.
+        Skips: logging, position tracking.
+        
+        Returns:
+            Order response with 'status', or None
+        """
+        if not self.client:
+            return None
+        
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=0.01,  # Minimum = instant fill at best bid
+                size=round(size, 2),
+                side=SELL,
+                fee_rate_bps=0
+            )
+            signed_order = self.client.create_order(order_args)
+            return self.client.post_order(signed_order, OrderType.FOK)
+        except Exception as e:
+            logger.error(f"Fast sell failed: {e}")
+            return None
+    
     def place_market_sell_order(
         self,
         token_id: str,
@@ -652,11 +721,11 @@ class FastTrader:
                 status = result.get('status', 'N/A')
                 error_msg = result.get('errorMsg', '')
                 order_id = result.get('orderID', 'N/A')
-                logger.info(f"MARKET SELL RESPONSE: success={success}, status={status}, orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}...")
+                logger.debug(f"MARKET SELL RESPONSE: success={success}, status={status}, orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}...")
                 if error_msg:
-                    logger.warning(f"Order errorMsg: {error_msg}")
+                    logger.debug(f"Order errorMsg: {error_msg}")
                 
-                logger.info(f"MARKET SELL EXECUTED: {size_rounded} shares")
+                logger.debug(f"MARKET SELL EXECUTED: {size_rounded} shares")
                 
                 # Remove from tracked positions
                 with self._position_lock:
@@ -665,7 +734,7 @@ class FastTrader:
                 
                 return result
             else:
-                logger.warning(f"Market sell order returned empty result")
+                logger.debug(f"Market sell order returned empty result")
                 
         except Exception as e:
             error_msg = str(e)

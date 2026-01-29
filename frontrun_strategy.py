@@ -410,39 +410,29 @@ class FrontrunStrategy:
             # Price = bid + 0.01 (aggressive to get filled)
             limit_price = round(bid_price + 0.01, 2)
             
-            # Calculate shares from USD size
-            shares = POSITION_SIZE_USD / limit_price if limit_price > 0 else 0
+            # Calculate shares from USD size (max 2 decimals for Polymarket)
+            shares = round(POSITION_SIZE_USD / limit_price, 2) if limit_price > 0 else 0
             
             start_ms = time.time() * 1000
             
-            result = self.trader.place_buy_order(
-                token_id=token_id,
-                side=side,
-                price=limit_price,
-                size=shares,
-                market_info={},  # Not needed for FOK
-                order_type="FOK"
-            )
+            # Use fast method - no warmup, no order details query, no stop loss pre-sign
+            result = self.trader.place_buy_order_fast(token_id, limit_price, shares)
             
             exec_ms = time.time() * 1000 - start_ms
             
             if result and result.get('status') in ['MATCHED', 'FILLED']:
                 fill_time = time.time() * 1000
                 
-                # Get actual fill data from trader.active_positions (already populated by place_buy_order via _get_filled_shares)
-                trader_pos = self.trader.active_positions.get(token_id, {})
-                actual_shares = trader_pos.get('shares', shares)
-                actual_price = trader_pos.get('entry_price', limit_price)
-                
+                # For fast orders, we use the limit price (actual fill price may be same or better)
                 self.active_positions[signal_id] = {
                     'token_id': token_id,
                     'side': side,
-                    'shares': actual_shares,
-                    'entry_price': actual_price,
+                    'shares': shares,
+                    'entry_price': limit_price,
                     'fill_time_ms': fill_time,
                     'exit_time_ms': fill_time + EXIT_DELAY_MS
                 }
-                logger.warning(f"BUY #{signal_id} | {side.upper()} {actual_shares:.1f}@{actual_price} | {exec_ms:.0f}ms")
+                logger.warning(f"BUY #{signal_id} | {side.upper()} {shares:.1f}@{limit_price} | {exec_ms:.0f}ms")
             else:
                 status = result.get('status', 'UNKNOWN') if result else 'NO_RESULT'
                 logger.warning(f"BUY #{signal_id} FAILED | {status} | {exec_ms:.0f}ms")
@@ -710,39 +700,25 @@ class FrontrunStrategy:
                 await asyncio.sleep(10)
     
     def _execute_sell_order(self, signal_id: int, position: Dict):
-        """Execute sell order in background thread"""
+        """Execute sell order in background thread - LATENCY CRITICAL"""
         try:
             token_id = position['token_id']
             side = position['side']
             shares = position['shares']
             entry_price = position['entry_price']
             
+            # Get current bid BEFORE sell for P&L estimate
+            exit_price = self.up_bid if side == 'up' else self.down_bid
+            
             start_ms = time.time() * 1000
             
-            # Market sell (FOK)
-            result = self.trader.place_market_sell_order(token_id, shares)
+            # Use fast method - no logging, no position tracking
+            result = self.trader.place_sell_order_fast(token_id, shares)
             
             exec_ms = time.time() * 1000 - start_ms
             
-            if result:
-                order_id = result.get('orderID')
-                exit_price = None
-                
-                # Try to get actual fill price from order details
-                if order_id and self.trader.client:
-                    try:
-                        order_info = self.trader.client.get_order(order_id)
-                        if order_info:
-                            # average_price or price from the order
-                            exit_price = float(order_info.get('price', 0)) or None
-                    except:
-                        pass
-                
-                # Fallback to current bid if we couldn't get real price
-                if not exit_price:
-                    exit_price = self.up_bid if side == 'up' else self.down_bid
-                
-                # Calculate P&L
+            if result and result.get('status') in ['MATCHED', 'FILLED']:
+                # Calculate P&L (using bid captured before sell)
                 if exit_price:
                     pnl = (exit_price - entry_price) * shares
                     pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
@@ -750,7 +726,8 @@ class FrontrunStrategy:
                 else:
                     logger.warning(f"SELL #{signal_id} | {side.upper()} {shares:.1f} | {exec_ms:.0f}ms")
             else:
-                logger.warning(f"SELL #{signal_id} FAILED | {exec_ms:.0f}ms")
+                status = result.get('status', 'UNKNOWN') if result else 'NO_RESULT'
+                logger.warning(f"SELL #{signal_id} FAILED | {status} | {exec_ms:.0f}ms")
                 
         except Exception as e:
             logger.error(f"SELL #{signal_id} ERROR: {e}")
