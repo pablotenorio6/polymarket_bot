@@ -497,6 +497,10 @@ class WebSocketUserFillsTracker:
     
     def _process_message(self, raw_message: str):
         """Process incoming fill/order messages"""
+        # Ignore empty messages (can happen during reconnect)
+        if not raw_message or raw_message.strip() == '':
+            return
+        
         try:
             data = json_loads(raw_message)
             
@@ -512,22 +516,26 @@ class WebSocketUserFillsTracker:
                     self._handle_order(event)
                     
         except Exception as e:
-            logger.debug(f"Failed to parse user message: {e}")
+            # Only log if it's not an empty/ping message
+            if len(raw_message) > 10:
+                logger.warning(f"Failed to parse user message: {e}")
     
     def _handle_trade(self, trade: Dict):
         """
         Handle trade fill event - update our position tracking.
         
         Trade statuses:
-        - MATCHED: Order matched, trade pending
-        - MINED: Transaction mined
-        - CONFIRMED: Transaction confirmed (final)
+        - MATCHED: Order matched, trade pending (FIRST - use this)
+        - MINED: Transaction mined (duplicate)
+        - CONFIRMED: Transaction confirmed (duplicate)
         - FAILED: Trade failed
+        
+        We only process MATCHED to avoid duplicates (same trade sends 3 messages).
         """
         status = trade.get('status', '')
         
-        # Only process confirmed or matched trades
-        if status not in ('MATCHED', 'MINED', 'CONFIRMED'):
+        # Only process MATCHED (first message) to avoid duplicates
+        if status != 'MATCHED':
             return
         
         asset_id = trade.get('asset_id')
@@ -549,10 +557,10 @@ class WebSocketUserFillsTracker:
         
         if side == 'BUY':
             self.positions[asset_id] = current + size
-            logger.info(f"[WS FILL] BUY {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
+            logger.warning(f"[WS FILL] BUY {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
         elif side == 'SELL':
             self.positions[asset_id] = max(0, current - size)
-            logger.info(f"[WS FILL] SELL {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
+            logger.warning(f"[WS FILL] SELL {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
         
         # Callback for external handling
         if self.on_fill:
@@ -636,10 +644,21 @@ class WebSocketUserFillsTracker:
         self.positions[token_id] = balance
     
     async def add_condition_id(self, condition_id: str):
-        """Add a new condition ID and resubscribe to WebSocket"""
+        """Add a new condition ID and reconnect WebSocket for clean state"""
         if condition_id not in self.condition_ids:
             self.condition_ids.append(condition_id)
-            # Resubscribe with updated list
-            if self.connected and self.ws:
-                await self.subscribe(self.condition_ids)
-                logger.debug(f"[WS] Added market {condition_id[:10]}..., now tracking {len(self.condition_ids)} markets")
+        
+        # Force reconnect for clean subscription state
+        logger.warning(f"[WS USER] Adding market {condition_id[:16]}... - reconnecting")
+        self.connected = False
+        if self.ws:
+            try:
+                await self.ws.close()
+            except:
+                pass
+            self.ws = None
+        
+        # Reconnect and subscribe to all markets
+        if await self.connect():
+            await self.subscribe(self.condition_ids)
+            logger.warning(f"[WS USER] Reconnected, tracking {len(self.condition_ids)} markets")

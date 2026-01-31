@@ -48,12 +48,14 @@ TRACK_INTERVAL_MS = 500  # Record every 500ms
 # Dynamic threshold configuration
 MIN_THRESHOLD_BTC = float(os.environ.get('MIN_THRESHOLD_BTC', '2'))  # Floor minimum
 PERCENTILE_THRESHOLD = float(os.environ.get('PERCENTILE_THRESHOLD', '99.9'))  # Percentile (~50 signals/hour from 36k buckets)
-LOOKBACK_MS = int(os.environ.get('LOOKBACK_MS', '600000'))  # 3 minutes in ms
+LOOKBACK_MS = int(os.environ.get('LOOKBACK_MS', '600000'))  # 10 minutes in ms
+MIN_VOLUME_HISTORY = int(os.environ.get('MIN_VOLUME_HISTORY', '1000'))  # Min samples before trading
 
 # Trading configuration
 TRADING_ENABLED = os.environ.get('TRADING_ENABLED', 'false').lower() == 'true'
 POSITION_SIZE_USD = float(os.environ.get('POSITION_SIZE_USD', '10'))  # USD per trade
 EXIT_DELAY_MS = int(os.environ.get('EXIT_DELAY_MS', '4000'))  # 4 seconds exit delay
+TRADE_COOLDOWN_MS = int(os.environ.get('TRADE_COOLDOWN_MS', '5000'))  # 5 seconds between trades
 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -174,6 +176,7 @@ class FrontrunStrategy:
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trade_exec")
         self.active_positions: Dict[int, Dict] = {}  # signal_id -> position info
         self.pending_buy_fills: Dict[str, List[int]] = {}  # token_id -> [signal_ids waiting for fill]
+        self.last_trade_ms: int = 0  # Cooldown tracking
     
     def _open_csv(self):
         """Open CSV file for writing signals (line-buffered for Docker)"""
@@ -409,70 +412,83 @@ class FrontrunStrategy:
                 await asyncio.sleep(VOLATILITY_UPDATE_INTERVAL)
     
     def _on_fill_received(self, token_id: str, side: str, size: float):
-        """Callback when WS receives a fill - update the correct signal's shares"""
-        if side != 'BUY':
-            return  # Only track buy fills (sells are final)
+        """Callback when WS receives a fill - CREATE position from WS (source of truth)"""
+        if side == 'BUY':
+            # Find the oldest pending signal for this token
+            pending_list = self.pending_buy_fills.get(token_id, [])
+            
+            if pending_list:
+                pending = pending_list.pop(0)  # FIFO - oldest first
+                signal_id = pending['signal_id']
+                
+                # Calculate latency: signal detection -> WS MATCHED
+                now_ms = time.time() * 1000
+                latency_ms = now_ms - pending['signal_time_ms']
+                
+                # CREATE position from WS fill (this is the source of truth)
+                self.active_positions[signal_id] = {
+                    'token_id': token_id,
+                    'side': pending['side'],
+                    'shares': size,  # Real shares from WS
+                    'shares_source': 'ws_fill',
+                    'entry_price': pending['entry_price'],
+                    'fill_time_ms': now_ms,
+                    'exit_time_ms': pending['signal_time_ms'] + EXIT_DELAY_MS
+                }
+                logger.warning(f"MATCHED #{signal_id} | {pending['side'].upper()} {size:.2f}sh @{pending['entry_price']} | {latency_ms:.0f}ms from signal")
+            else:
+                logger.warning(f"[WS FILL] BUY {size:.4f} of {token_id[:10]}... but no pending signal")
         
-        # Find the oldest pending signal for this token
-        pending = self.pending_buy_fills.get(token_id, [])
-        if pending:
-            signal_id = pending.pop(0)  # FIFO - oldest first
-            if signal_id in self.active_positions:
-                old_shares = self.active_positions[signal_id]['shares']
-                self.active_positions[signal_id]['shares'] = size
-                self.active_positions[signal_id]['shares_source'] = 'ws_fill'  # Debug
-                logger.warning(f"FILL #{signal_id} | WS confirmed: {old_shares:.2f} -> {size:.2f} shares")
+        elif side == 'SELL':
+            # Log sell fills for debugging
+            logger.info(f"[WS FILL] SELL {size:.4f} of {token_id[:10]}...")
     
     def _execute_buy_order(self, signal_id: int, token_id: str, side: str, bid_price: float, signal_time_ms: int):
-        """Execute buy order in background thread - LATENCY CRITICAL"""
+        """Execute buy order in background thread - LATENCY CRITICAL
+        
+        Position is NOT created here - it's created when WS fill arrives (source of truth).
+        We only register pending metadata and send the order.
+        """
         try:
             # Price = bid + 0.01 (aggressive to get filled)
             limit_price = round(bid_price + 0.01, 2)
             
             # Use USD amount directly (avoids decimal precision issues)
             usd_amount = round(POSITION_SIZE_USD, 2)
-            # Estimate shares for logging/tracking
-            shares_estimate = usd_amount / limit_price if limit_price > 0 else 0
             
-            # Register as pending fill BEFORE sending order
+            # Register as pending fill BEFORE sending order (with all metadata)
             if token_id not in self.pending_buy_fills:
                 self.pending_buy_fills[token_id] = []
-            self.pending_buy_fills[token_id].append(signal_id)
+            self.pending_buy_fills[token_id].append({
+                'signal_id': signal_id,
+                'side': side,
+                'entry_price': limit_price,
+                'signal_time_ms': signal_time_ms,
+                'usd_amount': usd_amount
+            })
             
-            start_ms = time.time() * 1000
-            
-            # Use fast method with USD amount (MarketOrderArgs)
+            # Send order - position will be created when WS fill arrives
             result = self.trader.place_buy_order_fast(token_id, limit_price, usd_amount)
             
-            exec_ms = time.time() * 1000 - start_ms
-            
-            # Check status (case-insensitive - API returns 'matched' not 'MATCHED')
-            status = result.get('status', '').upper() if result else ''
-            
-            if status in ['MATCHED', 'FILLED']:
-                # Track position (shares is estimate until WS fill updates it)
-                # EXIT_DELAY starts from SIGNAL time, not order fill time
-                self.active_positions[signal_id] = {
-                    'token_id': token_id,
-                    'side': side,
-                    'shares': shares_estimate,
-                    'shares_source': 'estimate',  # Debug: track where shares came from
-                    'entry_price': limit_price,
-                    'fill_time_ms': time.time() * 1000,
-                    'exit_time_ms': signal_time_ms + EXIT_DELAY_MS  # From signal, not fill
-                }
-                logger.warning(f"BUY #{signal_id} | {side.upper()} ${usd_amount}@{limit_price} ~{shares_estimate:.2f}sh | {exec_ms:.0f}ms")
+            # Only log errors - success is logged when WS fill arrives
+            if not result:
+                self._remove_pending(token_id, signal_id)
+                logger.error(f"BUY #{signal_id} FAILED | NO_RESULT")
             else:
-                # Remove from pending if order failed
-                if signal_id in self.pending_buy_fills.get(token_id, []):
-                    self.pending_buy_fills[token_id].remove(signal_id)
-                logger.warning(f"BUY #{signal_id} FAILED | {status or 'NO_RESULT'} | {exec_ms:.0f}ms")
+                status = result.get('status', '').upper()
+                if status not in ['MATCHED', 'FILLED', 'LIVE']:
+                    self._remove_pending(token_id, signal_id)
+                    logger.error(f"BUY #{signal_id} FAILED | {status}")
+                # Success case: wait for WS fill to create position and log
                 
         except Exception as e:
-            # Remove from pending on error
-            if token_id in self.pending_buy_fills and signal_id in self.pending_buy_fills[token_id]:
-                self.pending_buy_fills[token_id].remove(signal_id)
+            self._remove_pending(token_id, signal_id)
             logger.error(f"BUY #{signal_id} ERROR: {e}")
+    
+    def _remove_pending(self, token_id: str, signal_id: int):
+        """Remove a signal_id from pending_buy_fills"""
+        pending_list = self.pending_buy_fills.get(token_id, [])
+        self.pending_buy_fills[token_id] = [p for p in pending_list if p.get('signal_id') != signal_id]
     
     def _create_signal(self, timestamp_ms: int, direction: str, qty: float, count: int, price: float):
         """Create new signal and start tracking"""
@@ -515,6 +531,18 @@ class FrontrunStrategy:
                 logger.warning(f"SKIP #{self.signal_counter}: Outside time window (mins={mins_remaining})")
                 return
             
+            # Check minimum volume history for reliable threshold
+            if len(self.volume_history) < MIN_VOLUME_HISTORY:
+                logger.warning(f"SKIP #{self.signal_counter}: Insufficient volume history ({len(self.volume_history)}/{MIN_VOLUME_HISTORY})")
+                return
+            
+            # Check cooldown between trades
+            now_ms = int(time.time() * 1000)
+            if now_ms - self.last_trade_ms < TRADE_COOLDOWN_MS:
+                cooldown_remaining = (TRADE_COOLDOWN_MS - (now_ms - self.last_trade_ms)) / 1000
+                logger.warning(f"SKIP #{self.signal_counter}: Cooldown ({cooldown_remaining:.1f}s remaining)")
+                return
+            
             # BUY signal on Binance -> price going UP -> buy UP token
             # SELL signal on Binance -> price going DOWN -> buy DOWN token
             # Pass signal timestamp for exit_time calculation
@@ -523,13 +551,17 @@ class FrontrunStrategy:
                 if not (0.14 <= self.up_bid <= 0.86):
                     logger.warning(f"SKIP #{self.signal_counter}: UP price {self.up_bid} outside range")
                     return
+                self.last_trade_ms = now_ms  # Update cooldown
                 self.executor.submit(self._execute_buy_order, self.signal_counter, self.up_token_id, 'up', self.up_bid, timestamp_ms)
+                logger.warning(f"SIGNAL #{self.signal_counter} | BUY {qty:.2f} BTC | UP @{self.up_bid}")
             elif direction == 'SELL' and self.down_bid:
                 # Check price range (0.14-0.86)
                 if not (0.14 <= self.down_bid <= 0.86):
                     logger.warning(f"SKIP #{self.signal_counter}: DOWN price {self.down_bid} outside range")
                     return
+                self.last_trade_ms = now_ms  # Update cooldown
                 self.executor.submit(self._execute_buy_order, self.signal_counter, self.down_token_id, 'down', self.down_bid, timestamp_ms)
+                logger.warning(f"SIGNAL #{self.signal_counter} | SELL {qty:.2f} BTC | DOWN @{self.down_bid}")
     
     def _update_signal_prices(self):
         """Update price evolution for active signals"""
@@ -820,6 +852,7 @@ class FrontrunStrategy:
             self.trader = FastTrader()
             
             # Initialize fills tracker for real-time position updates
+            logger.warning(f"Fills tracker init: client={bool(self.trader.client)} condition_id={self.condition_id[:16] if self.condition_id else 'NONE'}...")
             if self.trader.client and self.condition_id:
                 self.fills_tracker = WebSocketUserFillsTracker(self.trader.client)
                 self.fills_tracker.on_fill = self._on_fill_received  # Register callback
@@ -828,6 +861,8 @@ class FrontrunStrategy:
                 else:
                     logger.warning("Fills tracker failed to start - using estimated shares")
                     self.fills_tracker = None
+            else:
+                logger.warning("Fills tracker NOT initialized - missing client or condition_id")
         else:
             logger.warning("TRADING DISABLED (simulation mode)")
         
