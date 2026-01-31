@@ -780,10 +780,11 @@ class FrontrunStrategy:
             shares_source = position.get('shares_source', 'unknown')
             
             # Use shares from this specific position (updated by WS callback if available)
-            shares = position['shares']
+            # Round DOWN to 2 decimals to avoid "insufficient shares" errors
+            shares = math.floor(position['shares'] * 100) / 100
             
             # Debug: log where shares came from
-            logger.warning(f"SELL #{signal_id} PREP | shares={shares:.4f} source={shares_source}")
+            logger.warning(f"SELL #{signal_id} PREP | shares={shares:.2f} source={shares_source}")
             
             if shares <= 0:
                 logger.warning(f"SELL #{signal_id} SKIPPED | No shares to sell")
