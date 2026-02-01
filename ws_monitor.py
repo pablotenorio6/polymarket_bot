@@ -557,10 +557,10 @@ class WebSocketUserFillsTracker:
         
         if side == 'BUY':
             self.positions[asset_id] = current + size
-            logger.warning(f"[WS FILL] BUY {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
+            # logger.warning(f"[WS FILL] BUY {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
         elif side == 'SELL':
             self.positions[asset_id] = max(0, current - size)
-            logger.warning(f"[WS FILL] SELL {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
+            # logger.warning(f"[WS FILL] SELL {size:.4f} of {asset_id[:10]}...{fee_info} | total: {self.positions[asset_id]:.4f}")
         
         # Callback for external handling
         if self.on_fill:
