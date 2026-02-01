@@ -772,7 +772,7 @@ class FrontrunStrategy:
                 await asyncio.sleep(10)
     
     def _execute_sell_order(self, signal_id: int, position: Dict):
-        """Execute sell order in background thread - LATENCY CRITICAL"""
+        """Execute sell order in background thread with retry logic"""
         try:
             token_id = position['token_id']
             side = position['side']
@@ -793,29 +793,42 @@ class FrontrunStrategy:
             # Get current bid BEFORE sell for P&L estimate
             exit_price = self.up_bid if side == 'up' else self.down_bid
             
-            start_ms = time.time() * 1000
-            
-            # Use fast method - no logging, no position tracking
-            result = self.trader.place_sell_order_fast(token_id, shares)
-            
-            exec_ms = time.time() * 1000 - start_ms
-            
-            # Check status (case-insensitive - API returns 'matched' not 'MATCHED')
-            # GTC can return: MATCHED/FILLED (instant) or LIVE (in orderbook)
-            status = result.get('status', '').upper() if result else ''
-            
-            if status in ['MATCHED', 'FILLED', 'LIVE']:
-                # Calculate P&L (using bid captured before sell)
-                # Note: LIVE means order is in book - for sell@0.01 it should fill instantly
-                status_note = " (LIVE)" if status == 'LIVE' else ""
-                if exit_price:
-                    pnl = (exit_price - entry_price) * shares
-                    pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-                    logger.warning(f"SELL #{signal_id}{status_note} | {side.upper()} {shares:.2f}sh ({shares_source}) | {entry_price}->{exit_price} | {pnl_str} | {exec_ms:.0f}ms")
+            # Retry logic: up to 3 attempts, reducing shares by 0.01 each time
+            max_retries = 3
+            for attempt in range(max_retries):
+                if shares <= 0:
+                    logger.warning(f"SELL #{signal_id} SKIPPED | No shares left after retries")
+                    return
+                
+                start_ms = time.time() * 1000
+                
+                # Use fast method - no logging, no position tracking
+                result = self.trader.place_sell_order_fast(token_id, shares)
+                
+                exec_ms = time.time() * 1000 - start_ms
+                
+                # Check status (case-insensitive - API returns 'matched' not 'MATCHED')
+                # GTC can return: MATCHED/FILLED (instant) or LIVE (in orderbook)
+                status = result.get('status', '').upper() if result else ''
+                
+                if status in ['MATCHED', 'FILLED', 'LIVE']:
+                    # Success - calculate P&L
+                    status_note = " (LIVE)" if status == 'LIVE' else ""
+                    retry_note = f" (retry {attempt})" if attempt > 0 else ""
+                    if exit_price:
+                        pnl = (exit_price - entry_price) * shares
+                        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+                        logger.warning(f"SELL #{signal_id}{status_note}{retry_note} | {side.upper()} {shares:.2f}sh ({shares_source}) | {entry_price}->{exit_price} | {pnl_str} | {exec_ms:.0f}ms")
+                    else:
+                        logger.warning(f"SELL #{signal_id}{status_note}{retry_note} | {side.upper()} {shares:.2f}sh ({shares_source}) | {exec_ms:.0f}ms")
+                    return  # Success, exit
                 else:
-                    logger.warning(f"SELL #{signal_id}{status_note} | {side.upper()} {shares:.2f}sh ({shares_source}) | {exec_ms:.0f}ms")
-            else:
-                logger.warning(f"SELL #{signal_id} FAILED | {status or 'NO_RESULT'} | shares={shares:.4f} | {exec_ms:.0f}ms")
+                    # Failed - log and retry with fewer shares
+                    logger.warning(f"SELL #{signal_id} RETRY {attempt+1}/{max_retries} | {status or 'NO_RESULT'} | shares={shares:.2f}")
+                    shares = round(shares - 0.01, 2)  # Reduce shares for next attempt
+            
+            # All retries exhausted
+            logger.error(f"SELL #{signal_id} FAILED | All {max_retries} retries exhausted")
                 
         except Exception as e:
             logger.error(f"SELL #{signal_id} ERROR: {e}")
