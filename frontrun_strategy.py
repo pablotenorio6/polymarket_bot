@@ -56,6 +56,7 @@ TRADING_ENABLED = os.environ.get('TRADING_ENABLED', 'false').lower() == 'true'
 POSITION_SIZE_USD = float(os.environ.get('POSITION_SIZE_USD', '10'))  # USD per trade
 EXIT_DELAY_MS = int(os.environ.get('EXIT_DELAY_MS', '4000'))  # 4 seconds exit delay
 TRADE_COOLDOWN_MS = int(os.environ.get('TRADE_COOLDOWN_MS', '5000'))  # 5 seconds between trades
+ALLOWED_SLIPPAGE = float(os.environ.get('ALLOWED_SLIPPAGE', '0.015'))  # 1,5% slippage
 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -474,8 +475,8 @@ class FrontrunStrategy:
         We only register pending metadata and send the order.
         """
         try:
-            # Price = bid + 0.01 (aggressive to get filled)
-            limit_price = round(bid_price + 0.01, 2)
+            # Price = bid + ALLOWED_SLIPPAGE (aggressive to get filled)
+            limit_price = bid_price + ALLOWED_SLIPPAGE
             
             # Use USD amount directly (avoids decimal precision issues)
             usd_amount = round(POSITION_SIZE_USD, 2)
