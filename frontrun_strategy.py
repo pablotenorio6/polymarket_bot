@@ -175,7 +175,8 @@ class FrontrunStrategy:
         self.fills_tracker: Optional[WebSocketUserFillsTracker] = None
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trade_exec")
         self.active_positions: Dict[int, Dict] = {}  # signal_id -> position info
-        self.pending_buy_fills: Dict[str, List[int]] = {}  # token_id -> [signal_ids waiting for fill]
+        self.pending_buy_fills: Dict[str, List] = {}  # token_id -> [pending buy info]
+        self.pending_sell_fills: Dict[str, List] = {}  # token_id -> [pending sell info]
         self.last_trade_ms: int = 0  # Cooldown tracking
     
     def _open_csv(self):
@@ -440,8 +441,31 @@ class FrontrunStrategy:
                 logger.warning(f"[WS FILL] BUY {size:.4f} of {token_id[:10]}... but no pending signal")
         
         elif side == 'SELL':
-            # Log sell fills for debugging
-            logger.info(f"[WS FILL] SELL {size:.4f} of {token_id[:10]}...")
+            # Find the oldest pending sell for this token
+            pending_list = self.pending_sell_fills.get(token_id, [])
+            
+            if pending_list:
+                pending = pending_list.pop(0)  # FIFO - oldest first
+                signal_id = pending['signal_id']
+                entry_price = pending['entry_price']
+                
+                # Get actual sell price from WS (we need to calculate from the trade)
+                # For now, use the shares_requested vs actual to detect partial fills
+                shares_requested = pending['shares_requested']
+                
+                # Calculate P&L using entry price and current bid (best estimate)
+                # Note: actual sell price may differ slightly
+                exit_price = self.up_bid if pending['side'] == 'up' else self.down_bid
+                
+                if exit_price:
+                    pnl = (exit_price - entry_price) * size
+                    pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+                    partial_note = f" (partial: {size:.2f}/{shares_requested:.2f})" if abs(size - shares_requested) > 0.01 else ""
+                    logger.warning(f"SOLD #{signal_id} | {pending['side'].upper()} {size:.2f}sh{partial_note} | {entry_price}->{exit_price} | {pnl_str} | via WS")
+                else:
+                    logger.warning(f"SOLD #{signal_id} | {pending['side'].upper()} {size:.2f}sh | via WS")
+            else:
+                logger.warning(f"[WS FILL] SELL {size:.4f} of {token_id[:10]}... but no pending signal")
     
     def _execute_buy_order(self, signal_id: int, token_id: str, side: str, bid_price: float, signal_time_ms: int):
         """Execute buy order in background thread - LATENCY CRITICAL
@@ -772,26 +796,22 @@ class FrontrunStrategy:
                 await asyncio.sleep(10)
     
     def _execute_sell_order(self, signal_id: int, position: Dict):
-        """Execute sell order in background thread with retry logic"""
+        """Execute sell order in background thread with retry logic.
+        
+        Success is NOT logged here - it's logged when WS fill arrives (source of truth).
+        """
         try:
             token_id = position['token_id']
             side = position['side']
             entry_price = position['entry_price']
-            shares_source = position.get('shares_source', 'unknown')
             
             # Use shares from this specific position (updated by WS callback if available)
             # Round DOWN to 2 decimals to avoid "insufficient shares" errors
             shares = math.floor(position['shares'] * 100) / 100
             
-            # Debug: log where shares came from
-            logger.warning(f"SELL #{signal_id} PREP | shares={shares:.2f} source={shares_source}")
-            
             if shares <= 0:
                 logger.warning(f"SELL #{signal_id} SKIPPED | No shares to sell")
                 return
-            
-            # Get current bid BEFORE sell for P&L estimate
-            exit_price = self.up_bid if side == 'up' else self.down_bid
             
             # Retry logic: up to 3 attempts, reducing shares by 0.01 each time
             max_retries = 3
@@ -800,30 +820,30 @@ class FrontrunStrategy:
                     logger.warning(f"SELL #{signal_id} SKIPPED | No shares left after retries")
                     return
                 
-                start_ms = time.time() * 1000
+                # Register as pending sell BEFORE sending order
+                if token_id not in self.pending_sell_fills:
+                    self.pending_sell_fills[token_id] = []
+                pending_entry = {
+                    'signal_id': signal_id,
+                    'side': side,
+                    'entry_price': entry_price,
+                    'shares_requested': shares,
+                    'attempt': attempt
+                }
+                self.pending_sell_fills[token_id].append(pending_entry)
                 
-                # Use fast method - no logging, no position tracking
+                # Send order
                 result = self.trader.place_sell_order_fast(token_id, shares)
                 
-                exec_ms = time.time() * 1000 - start_ms
-                
-                # Check status (case-insensitive - API returns 'matched' not 'MATCHED')
-                # GTC can return: MATCHED/FILLED (instant) or LIVE (in orderbook)
+                # Check status
                 status = result.get('status', '').upper() if result else ''
                 
                 if status in ['MATCHED', 'FILLED', 'LIVE']:
-                    # Success - calculate P&L
-                    status_note = " (LIVE)" if status == 'LIVE' else ""
-                    retry_note = f" (retry {attempt})" if attempt > 0 else ""
-                    if exit_price:
-                        pnl = (exit_price - entry_price) * shares
-                        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-                        logger.warning(f"SELL #{signal_id}{status_note}{retry_note} | {side.upper()} {shares:.2f}sh ({shares_source}) | {entry_price}->{exit_price} | {pnl_str} | {exec_ms:.0f}ms")
-                    else:
-                        logger.warning(f"SELL #{signal_id}{status_note}{retry_note} | {side.upper()} {shares:.2f}sh ({shares_source}) | {exec_ms:.0f}ms")
-                    return  # Success, exit
+                    # Success - WS fill will log the confirmation
+                    return
                 else:
-                    # Failed - log and retry with fewer shares
+                    # Failed - remove from pending and retry with fewer shares
+                    self._remove_pending_sell(token_id, signal_id)
                     logger.warning(f"SELL #{signal_id} RETRY {attempt+1}/{max_retries} | {status or 'NO_RESULT'} | shares={shares:.2f}")
                     shares = round(shares - 0.01, 2)  # Reduce shares for next attempt
             
@@ -831,7 +851,13 @@ class FrontrunStrategy:
             logger.error(f"SELL #{signal_id} FAILED | All {max_retries} retries exhausted")
                 
         except Exception as e:
+            self._remove_pending_sell(token_id, signal_id)
             logger.error(f"SELL #{signal_id} ERROR: {e}")
+    
+    def _remove_pending_sell(self, token_id: str, signal_id: int):
+        """Remove a signal_id from pending_sell_fills"""
+        pending_list = self.pending_sell_fills.get(token_id, [])
+        self.pending_sell_fills[token_id] = [p for p in pending_list if p.get('signal_id') != signal_id]
     
     async def _position_manager_loop(self):
         """Check positions and exit after EXIT_DELAY_MS"""
