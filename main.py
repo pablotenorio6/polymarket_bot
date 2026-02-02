@@ -184,9 +184,9 @@ class FastTradingBot:
         logger.info("=" * 60)
         
         # Future market scanning config
-        self.future_scan_hours = 24  # Scan 24 hours ahead
+        self.future_scan_hours = 48  # Scan 48 hours ahead
         self.last_future_scan = 0
-        self.future_scan_interval = 60  # Scan every 60 seconds
+        self.future_scan_interval = 5  # Scan every 5 seconds
         
         # Core components (use persistent client for best performance)
         # Pass market prefix and type to monitor

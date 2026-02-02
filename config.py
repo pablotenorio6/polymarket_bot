@@ -16,7 +16,7 @@ STOP_LOSS_PRICE = 0.01  # Not used in current strategy
 MAX_ATTEMPTS_PER_MARKET = 3
 
 # Position sizing
-MAX_POSITION_SIZE = 100  # Maximum USD to risk per trade
+MAX_POSITION_SIZE = 200  # Maximum USD to risk per trade
 
 # ============================================
 # MONITORING & PERFORMANCE
