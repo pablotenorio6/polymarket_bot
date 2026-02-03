@@ -48,12 +48,16 @@ class EarlyQueueStrategy(BaseStrategy):
         logger.info("Recovering orders state from Polymarket...")
         
         # Track active markets with their end times and token IDs
-        # condition_id -> {end_time, up_token_id, down_token_id, orders_cancelled}
+        # condition_id -> {end_time, up_token_id, down_token_id, orders_cancelled, has_up_order, has_down_order}
         self.active_market_info: Dict[str, Dict] = {}
+        
+        # Track which tokens have open orders (for checking missing orders)
+        self.tokens_with_orders: set = set()
         
         try:
             # Get token IDs with open orders
             open_token_ids = self.trader.get_open_order_token_ids()
+            self.tokens_with_orders = set(open_token_ids) if open_token_ids else set()
             
             if not open_token_ids:
                 logger.info("No existing open orders found - starting fresh")
@@ -98,26 +102,52 @@ class EarlyQueueStrategy(BaseStrategy):
                         }
             
             # Find condition_ids for our open orders and reconstruct active_market_info
+            # Track which specific orders (UP/DOWN) exist for each market
             recovered_markets = set()
+            markets_with_both = 0
+            markets_missing_orders = 0
+            
             for token_id in open_token_ids:
                 condition_id = token_to_condition.get(token_id)
                 if condition_id:
                     recovered_markets.add(condition_id)
                     # Reconstruct active_market_info for cancellation monitoring
-                    if condition_id in market_info_map and condition_id not in self.active_market_info:
-                        self.active_market_info[condition_id] = {
-                            'end_time': market_info_map[condition_id]['end_time'],
-                            'up_token_id': market_info_map[condition_id]['up_token_id'],
-                            'down_token_id': market_info_map[condition_id]['down_token_id'],
-                            'orders_cancelled': False
-                        }
+                    if condition_id in market_info_map:
+                        if condition_id not in self.active_market_info:
+                            self.active_market_info[condition_id] = {
+                                'end_time': market_info_map[condition_id]['end_time'],
+                                'up_token_id': market_info_map[condition_id]['up_token_id'],
+                                'down_token_id': market_info_map[condition_id]['down_token_id'],
+                                'orders_cancelled': False,
+                                'has_up_order': False,
+                                'has_down_order': False
+                            }
+                        
+                        # Mark which order exists
+                        if token_id == market_info_map[condition_id]['up_token_id']:
+                            self.active_market_info[condition_id]['has_up_order'] = True
+                        elif token_id == market_info_map[condition_id]['down_token_id']:
+                            self.active_market_info[condition_id]['has_down_order'] = True
             
-            # Add to our tracking set
-            self.processed_markets.update(recovered_markets)
+            # Count markets with both orders vs missing orders
+            for condition_id, info in self.active_market_info.items():
+                if info.get('has_up_order') and info.get('has_down_order'):
+                    markets_with_both += 1
+                    # Only mark as fully processed if BOTH orders exist
+                    self.processed_markets.add(condition_id)
+                else:
+                    markets_missing_orders += 1
+                    missing = []
+                    if not info.get('has_up_order'):
+                        missing.append('UP')
+                    if not info.get('has_down_order'):
+                        missing.append('DOWN')
+                    logger.warning(f"Market {condition_id[:8]}... missing orders: {', '.join(missing)}")
             
             logger.info(f"Recovered {len(recovered_markets)} markets with existing orders")
+            logger.info(f"  - {markets_with_both} markets have BOTH orders (fully processed)")
+            logger.info(f"  - {markets_missing_orders} markets missing orders (will place on next scan)")
             logger.info(f"Reconstructed {len(self.active_market_info)} markets for cancellation monitoring")
-            logger.info(f"Total markets tracked: {len(self.processed_markets)}")
             
         except Exception as e:
             logger.error(f"Error recovering orders state: {e}")
@@ -127,17 +157,30 @@ class EarlyQueueStrategy(BaseStrategy):
         """
         Place both UP and DOWN limit orders as soon as market is detected.
         This happens BEFORE the market becomes active, securing FIFO priority.
+        
+        Also handles placing missing orders if only one side exists.
         """
         condition_id = market_data['condition_id']
-        
-        # Skip if already processed
-        if self.is_market_processed(condition_id):
-            return
-        
         up_token = market_data['up_token_id']
         down_token = market_data['down_token_id']
         start_time = market_data['start_time']
         market = market_data['market']
+        
+        # Check if we already have orders for this market
+        existing_info = self.active_market_info.get(condition_id, {})
+        has_up = existing_info.get('has_up_order', False) or up_token in self.tokens_with_orders
+        has_down = existing_info.get('has_down_order', False) or down_token in self.tokens_with_orders
+        
+        # Skip if both orders already exist
+        if has_up and has_down:
+            if not self.is_market_processed(condition_id):
+                self.mark_market_processed(condition_id)
+            return
+        
+        # Determine what we need to place
+        need_up = not has_up
+        need_down = not has_down
+        is_recovery = has_up or has_down  # True if we're placing missing order(s)
         
         # Format start time for logging
         et_tz = pytz.timezone('America/New_York')
@@ -148,58 +191,90 @@ class EarlyQueueStrategy(BaseStrategy):
         # Get current crypto price at detection
         crypto_price = self.get_crypto_price()
         
-        logger.info(f"NEW MARKET DETECTED: {market_data['question'][:50]}...")
+        if is_recovery:
+            missing = []
+            if need_up:
+                missing.append('UP')
+            if need_down:
+                missing.append('DOWN')
+            logger.info(f"PLACING MISSING ORDER(S): {market_data['question'][:50]}...")
+            logger.info(f"  Missing: {', '.join(missing)}")
+        else:
+            logger.info(f"NEW MARKET DETECTED: {market_data['question'][:50]}...")
+        
         logger.info(f"  Starts: {start_et.strftime('%Y-%m-%d %H:%M')} ET ({hours_until:.1f}h from now)")
         if crypto_price:
             logger.info(f"  {self.market_symbol} price at detection: ${crypto_price:,.2f}")
         logger.info(f"  Placing orders @ ${self.entry_price:.3f}...")
         
-        # Place UP order
-        up_order = self.trader.place_buy_order(
-            token_id=up_token,
-            side='up',
-            price=self.entry_price,
-            size=self.position_size,
-            market_info=market,
-            order_type="GTC"
-        )
+        up_order = None
+        down_order = None
         
-        if up_order:
-            logger.info(f"  UP order placed - Size: ${self.position_size}")
+        # Place UP order if needed
+        if need_up:
+            up_order = self.trader.place_buy_order(
+                token_id=up_token,
+                side='up',
+                price=self.entry_price,
+                size=self.position_size,
+                market_info=market,
+                order_type="GTC"
+            )
+            
+            if up_order:
+                logger.info(f"  UP order placed - Size: ${self.position_size}")
+                self.tokens_with_orders.add(up_token)
+                has_up = True
+            else:
+                logger.warning(f"  Failed to place UP order")
         else:
-            logger.warning(f" Failed to place UP order")
+            logger.info(f"  UP order already exists - skipping")
         
-        # Place DOWN order
-        down_order = self.trader.place_buy_order(
-            token_id=down_token,
-            side='down',
-            price=self.entry_price,
-            size=self.position_size,
-            market_info=market,
-            order_type="GTC"
-        )
-        
-        if down_order:
-            logger.info(f"  DOWN order placed - Size: ${self.position_size}")
+        # Place DOWN order if needed
+        if need_down:
+            down_order = self.trader.place_buy_order(
+                token_id=down_token,
+                side='down',
+                price=self.entry_price,
+                size=self.position_size,
+                market_info=market,
+                order_type="GTC"
+            )
+            
+            if down_order:
+                logger.info(f"  DOWN order placed - Size: ${self.position_size}")
+                self.tokens_with_orders.add(down_token)
+                has_down = True
+            else:
+                logger.warning(f"  Failed to place DOWN order")
         else:
-            logger.warning(f" Failed to place DOWN order")
+            logger.info(f"  DOWN order already exists - skipping")
         
-        # Mark market as processed (even if orders failed, to avoid retry spam)
-        self.mark_market_processed(condition_id)
-        
-        if up_order and down_order:
+        # Only mark as fully processed if BOTH orders now exist
+        if has_up and has_down:
+            self.mark_market_processed(condition_id)
             logger.info(f"  Both orders queued - MAXIMUM PRIORITY secured!")
+        else:
+            # Don't mark as processed - will retry missing order on next scan
+            missing = []
+            if not has_up:
+                missing.append('UP')
+            if not has_down:
+                missing.append('DOWN')
+            logger.warning(f"  Still missing: {', '.join(missing)} - will retry on next scan")
         
-        # Track this market for cancellation monitoring
+        # Track/update this market for cancellation monitoring
         self.active_market_info[condition_id] = {
             'end_time': market_data['end_time'],
             'up_token_id': up_token,
             'down_token_id': down_token,
-            'orders_cancelled': False
+            'orders_cancelled': False,
+            'has_up_order': has_up,
+            'has_down_order': has_down
         }
         
         # Log total markets with orders
-        logger.info(f"  Total markets with orders: {len(self.processed_markets)}")
+        logger.info(f"  Total fully processed markets: {len(self.processed_markets)}")
     
     async def on_price_update(
         self,
