@@ -39,6 +39,9 @@ trading_bot.log
 .DS_Store
 Thumbs.db
 
+# Data files
+data/*.csv
+
 # Sensitive data
 private_keys.txt
 secrets.json

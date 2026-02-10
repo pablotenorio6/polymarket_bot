@@ -126,7 +126,7 @@ from redeem import RedeemManager
 from ws_monitor import HybridPriceMonitor
 from data_collector import DataCollector
 from rtds_crypto_prices import RTDSCryptoPrices
-from cash_balance import get_available_cash_usdc_from_clob_client
+from scripts.cash_balance import get_available_cash_usdc_from_clob_client
 
 
 class FastTradingBot:

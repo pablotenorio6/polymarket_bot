@@ -13,6 +13,7 @@ import csv
 import json
 import time
 import os
+import sys
 import logging
 import math
 from datetime import datetime, timezone
@@ -20,6 +21,9 @@ from typing import Optional, Dict, List
 from dataclasses import dataclass, field, asdict
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+
+# Add project root to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import websockets
 import requests

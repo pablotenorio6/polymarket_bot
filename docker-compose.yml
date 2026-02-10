@@ -165,7 +165,7 @@ services:
     environment:
       - THRESHOLD_BTC=5.0
       - OUTPUT_DIR=/app/signals
-    command: python frontrun_strategy.py
+    command: python scripts/frontrun_strategy.py
     volumes:
       - ./signals:/app/signals
     tty: true
@@ -173,19 +173,4 @@ services:
     profiles:
       - frontrun  # Start with: docker compose --profile frontrun up
 
-  # ============================================
-  # BACKTEST COLLECTOR - Collect data for analysis
-  # ============================================
-  
-  collector:
-    build: .
-    container_name: polymarket-collector
-    restart: "no"
-    env_file:
-      - .env
-    command: python backtest_collector.py --duration 3600 --output /app/data/backtest.csv
-    volumes:
-      - ./backtest_data:/app/data
-    profiles:
-      - collect  # Start with: docker compose --profile collect up
  

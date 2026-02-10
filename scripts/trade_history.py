@@ -10,6 +10,9 @@ import logging
 from datetime import datetime
 from typing import List, Dict
 
+# Add project root to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,

@@ -64,7 +64,7 @@ Three independent WebSocket connections serve different purposes:
 
 All have HTTP polling fallbacks on disconnect.
 
-### Core Components
+### Core Components (root directory)
 
 - `main.py` — `FastTradingBot`: Event loop orchestrator, CLI arg parsing, strategy lifecycle
 - `trader.py` — `FastTrader`: Pre-signed order execution, position tracking, thread-safe with locks
@@ -73,6 +73,13 @@ All have HTTP polling fallbacks on disconnect.
 - `auth.py` — `PolymarketAuth`: Wallet auth via py-clob-client, supports EOA/Magic/Browser proxy (SIGNATURE_TYPE 0/1/2)
 - `redeem.py` — Auto-redemption of resolved positions back to USDC
 - `data_collector.py` — Records per-second price snapshots, submits to local API on market end
+
+### Directory Layout
+
+- `strategies/` — Pluggable trading strategies (all inherit `BaseStrategy`)
+- `scripts/` — Standalone utility scripts (cash_balance, trade_history, set_allowances, test_order, frontrun_strategy). Run directly with `python scripts/<name>.py`.
+- `analysis/` — Research and backtesting tools (not used by the bot at runtime)
+- `data/` — Data files (CSVs, etc. — gitignored)
 
 ### Key Patterns
 
