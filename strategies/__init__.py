@@ -16,6 +16,7 @@ from strategies.early_queue import EarlyQueueStrategy
 from strategies.expected_value import ExpectedValueStrategy
 from strategies.whale_copy import WhaleCopyStrategy
 from strategies.whale_frontrun import WhaleFrontrunStrategy
+from strategies.postclose_sniper import PostCloseSniperStrategy
 
 # Registry of available strategies
 STRATEGIES = {
@@ -23,6 +24,7 @@ STRATEGIES = {
     "expected_value": ExpectedValueStrategy,
     "whale_copy": WhaleCopyStrategy,
     "whale_frontrun": WhaleFrontrunStrategy,
+    "postclose_sniper": PostCloseSniperStrategy,
 }
 
 def get_strategy(name: str) -> type:
@@ -32,4 +34,4 @@ def get_strategy(name: str) -> type:
         raise ValueError(f"Unknown strategy '{name}'. Available: {available}")
     return STRATEGIES[name]
 
-__all__ = ["BaseStrategy", "EarlyQueueStrategy", "ExpectedValueStrategy", "WhaleCopyStrategy", "WhaleFrontrunStrategy", "STRATEGIES", "get_strategy"]
+__all__ = ["BaseStrategy", "EarlyQueueStrategy", "ExpectedValueStrategy", "WhaleCopyStrategy", "WhaleFrontrunStrategy", "PostCloseSniperStrategy", "STRATEGIES", "get_strategy"]

@@ -341,8 +341,15 @@ class FastTradingBot:
             else:
                 market_end_et = self.market_end_time.astimezone(et_tz)
             
-            if now_et >= market_end_et:
-                logger.info(f"Market expired (now: {now_et.strftime('%H:%M:%S')} ET >= end: {market_end_et.strftime('%H:%M:%S')} ET)")
+            # Allow strategies to extend monitoring past end_time
+            grace = getattr(self.strategy, 'post_close_grace_seconds', 0) if self.strategy else 0
+            effective_end_et = market_end_et + timedelta(seconds=grace)
+
+            if now_et >= effective_end_et:
+                if grace > 0:
+                    logger.info(f"Market expired after {grace}s grace (now: {now_et.strftime('%H:%M:%S')} ET >= end+grace: {effective_end_et.strftime('%H:%M:%S')} ET)")
+                else:
+                    logger.info(f"Market expired (now: {now_et.strftime('%H:%M:%S')} ET >= end: {market_end_et.strftime('%H:%M:%S')} ET)")
                 # Mark for saving - will be saved in _refresh_market
                 self._market_expired = True
                 return True

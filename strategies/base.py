@@ -54,6 +54,10 @@ class BaseStrategy(ABC):
     requires_price_websocket: bool = True   # Real-time token prices via WebSocket
     requires_data_collector: bool = True    # Send market data to API
     requires_rtds: bool = True              # Real-time crypto prices (BTC/ETH/SOL)
+
+    # Extended monitoring window (seconds after end_time to keep monitoring)
+    # Override in subclasses that need post-close activity (e.g., postclose_sniper)
+    post_close_grace_seconds: int = 0
     
     def __init__(
         self,
