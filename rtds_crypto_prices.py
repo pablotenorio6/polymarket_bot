@@ -1,8 +1,9 @@
 """
-Polymarket Real-Time Data Stream (RTDS) for Crypto Prices.
+Polymarket Real-Time Data Stream (RTDS) for Chainlink Crypto Prices.
 
-Connects to wss://ws-live-data.polymarket.com for real-time BTC/ETH/SOL prices.
-See: https://docs.polymarket.com/developers/RTDS/RTDS-overview
+Connects to wss://ws-live-data.polymarket.com for real-time BTC/ETH/SOL prices
+from the Chainlink oracle (the actual resolution source for Polymarket markets).
+See: https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices#chainlink-source-crypto_prices_chainlink
 """
 
 import asyncio
@@ -23,10 +24,11 @@ RTDS_URL = "wss://ws-live-data.polymarket.com"
 
 class RTDSCryptoPrices:
     """
-    Real-time crypto prices from Polymarket RTDS.
-    
-    Provides BTC, ETH, SOL prices updated in real-time.
-    Much faster updates than Chainlink (~1 second vs ~30-60 seconds).
+    Real-time Chainlink crypto prices from Polymarket RTDS.
+
+    Provides BTC, ETH, SOL prices from the Chainlink oracle (~1s updates).
+    Chainlink is the actual resolution source for Polymarket crypto markets.
+    Symbol format: btc/usd, eth/usd, sol/usd
     """
     
     def __init__(self):
@@ -71,19 +73,19 @@ class RTDSCryptoPrices:
             return False
         
         try:
-            # Subscribe to crypto_prices topic
+            # Subscribe to Chainlink crypto prices topic
             subscribe_msg = {
                 "action": "subscribe",
                 "subscriptions": [
                     {
-                        "topic": "crypto_prices",
-                        "type": "update"
+                        "topic": "crypto_prices_chainlink",
+                        "type": "*"
                     }
                 ]
             }
-            
+
             await self.ws.send(json.dumps(subscribe_msg))
-            logger.info("[RTDS] Subscribed to crypto_prices")
+            logger.info("[RTDS] Subscribed to crypto_prices_chainlink")
             return True
             
         except Exception as e:
@@ -144,34 +146,32 @@ class RTDSCryptoPrices:
     
     def _handle_message(self, raw_message: str):
         """
-        Process incoming RTDS message.
-        
+        Process incoming RTDS Chainlink message.
+
         Message format:
         {
-            "connection_id": "...",
-            "topic": "crypto_prices",
+            "topic": "crypto_prices_chainlink",
             "type": "update",
-            "timestamp": 1768395368144,
+            "timestamp": 1753314064237,
             "payload": {
-                "symbol": "btcusdt",
-                "value": 95077.56,
-                ...
+                "symbol": "btc/usd",
+                "timestamp": 1753314064213,
+                "value": 95077.56
             }
         }
         """
         try:
             if not raw_message:
                 return
-                
+
             data = json.loads(raw_message)
-            
+
             topic = data.get('topic')
-            msg_type = data.get('type')
             payload = data.get('payload', {})
-            
-            if topic == 'crypto_prices' and msg_type == 'update':
+
+            if topic == 'crypto_prices_chainlink':
                 self._process_price_update(payload)
-                
+
         except json.JSONDecodeError:
             logger.debug(f"[RTDS] Invalid JSON: {raw_message[:100]}")
         except Exception as e:
@@ -179,32 +179,31 @@ class RTDSCryptoPrices:
     
     def _process_price_update(self, payload: Dict):
         """
-        Process crypto price update from RTDS.
-        
-        Expected format from Polymarket:
+        Process Chainlink crypto price update from RTDS.
+
+        Expected format:
         {
-            "symbol": "btcusdt",
-            "value": 95077.56,
-            "full_accuracy_value": "95077.56000000",
-            "timestamp": 1768395368000
+            "symbol": "btc/usd",
+            "timestamp": 1753314064213,
+            "value": 95077.56
         }
         """
         try:
             if not isinstance(payload, dict):
                 return
-            
-            # Get symbol and normalize (btcusdt -> BTC)
+
+            # Get symbol and normalize (btc/usd -> BTC)
             symbol = payload.get('symbol', '')
-            if symbol.lower().endswith('usdt'):
-                symbol = symbol[:-4].upper()  # btcusdt -> BTC
+            if '/' in symbol:
+                symbol = symbol.split('/')[0].upper()  # btc/usd -> BTC
             else:
                 symbol = symbol.upper()
-            
+
             # Get price from 'value' field
             price = payload.get('value')
             if price is not None and symbol:
                 self._update_price(symbol, float(price))
-                                
+
         except Exception as e:
             logger.debug(f"[RTDS] Error processing price: {e}")
     

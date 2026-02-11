@@ -86,95 +86,21 @@ class PostCloseSniperStrategy(BaseStrategy):
         # Per-market state: condition_id -> MarketSnipeState
         self.market_states: Dict[str, "MarketSnipeState"] = {}
 
-        # Chainlink price cache (separate from Binance in rtds_client)
-        self.chainlink_prices: Dict[str, float] = {}  # symbol -> price
-        self.chainlink_last_ts: Dict[str, float] = {}  # symbol -> timestamp_ms
-
     async def initialize(self) -> None:
         """
-        Initialize: subscribe to Chainlink feed via RTDS.
+        Initialize post-close sniper strategy.
 
-        The existing rtds_client subscribes to crypto_prices (Binance).
-        We need to ALSO subscribe to crypto_prices_chainlink.
+        RTDS now subscribes directly to crypto_prices_chainlink,
+        so Chainlink prices are available via rtds_client.get_price().
         """
         logger.info("[Sniper] Initializing post-close sniper strategy")
 
-        if self.rtds_client and self.rtds_client.ws and self.rtds_client.connected:
-            await self._subscribe_chainlink()
-        else:
+        if not (self.rtds_client and self.rtds_client.connected):
             logger.warning("[Sniper] RTDS not connected - Chainlink feed unavailable")
             logger.warning("[Sniper] Strategy will not be able to determine winners")
 
-    async def _subscribe_chainlink(self):
-        """
-        Subscribe to Chainlink price feed on the existing RTDS WebSocket.
-
-        Topic: crypto_prices_chainlink, type: update
-        Payload format: {symbol: "btc/usd", value: 68862.10, timestamp: 1770711759000}
-        """
-        import json
-
-        subscribe_msg = {
-            "action": "subscribe",
-            "subscriptions": [{
-                "topic": "crypto_prices_chainlink",
-                "type": "update",
-            }]
-        }
-
-        try:
-            await self.rtds_client.ws.send(json.dumps(subscribe_msg))
-            logger.info("[Sniper] Subscribed to crypto_prices_chainlink via RTDS")
-
-            # Patch the RTDS message handler to also route Chainlink messages to us
-            original_handler = self.rtds_client._handle_message
-            strategy_ref = self  # Capture reference for closure
-
-            def patched_handler(raw_message: str):
-                # Call original handler first (for Binance prices)
-                original_handler(raw_message)
-                # Also process Chainlink messages
-                try:
-                    import json as _json
-                    data = _json.loads(raw_message)
-                    if data.get('topic') == 'crypto_prices_chainlink' and data.get('type') == 'update':
-                        strategy_ref._process_chainlink_update(data.get('payload', {}))
-                except Exception:
-                    pass
-
-            self.rtds_client._handle_message = patched_handler
-            logger.info("[Sniper] Patched RTDS handler for Chainlink messages")
-
-        except Exception as e:
-            logger.error(f"[Sniper] Failed to subscribe to Chainlink: {e}")
-
-    def _process_chainlink_update(self, payload: Dict):
-        """Process a Chainlink price update from RTDS."""
-        if not isinstance(payload, dict):
-            return
-
-        symbol = payload.get('symbol', '')  # e.g. "btc/usd"
-        value = payload.get('value')
-        ts = payload.get('timestamp', 0)
-
-        if value is None or not symbol:
-            return
-
-        # Normalize symbol: "btc/usd" -> "BTC"
-        normalized = symbol.split('/')[0].upper()
-
-        self.chainlink_prices[normalized] = float(value)
-        self.chainlink_last_ts[normalized] = ts
-
-        logger.debug(f"[Sniper] Chainlink {normalized}: ${float(value):,.2f}")
-
     def get_chainlink_price(self, symbol: str = None) -> Optional[float]:
-        """Get current Chainlink price for the market's crypto."""
-        sym = (symbol or self.market_symbol).upper()
-        return self.chainlink_prices.get(sym)
-
-    def get_binance_price(self, symbol: str = None) -> Optional[float]:
-        """Get current Binance price from RTDS."""
+        """Get current Chainlink price from RTDS."""
         sym = (symbol or self.market_symbol).upper()
         if self.rtds_client:
             return self.rtds_client.get_price(sym)
@@ -220,20 +146,12 @@ class PostCloseSniperStrategy(BaseStrategy):
             return
 
         chainlink_price = self.get_chainlink_price()
-        binance_price = self.get_binance_price()
 
         if chainlink_price:
             state.price_to_beat = chainlink_price
             logger.info(f"[Sniper] PRICE TO BEAT captured: ${chainlink_price:,.2f} (Chainlink)")
-            if binance_price:
-                logger.info(f"[Sniper]   Binance at same time: ${binance_price:,.2f} (delta: ${abs(binance_price - chainlink_price):,.2f})")
         else:
             logger.warning(f"[Sniper] Could not capture Chainlink price at market start!")
-            # Fallback: use Binance price (less accurate for resolution)
-            if binance_price:
-                state.price_to_beat = binance_price
-                state.price_to_beat_source = "binance_fallback"
-                logger.warning(f"[Sniper] Using Binance fallback: ${binance_price:,.2f}")
 
     async def on_price_update(
         self,
@@ -418,7 +336,6 @@ class PostCloseSniperStrategy(BaseStrategy):
     def _log_oracle_state(self, state: "MarketSnipeState"):
         """Log current oracle prices and prediction."""
         chainlink = self.get_chainlink_price()
-        binance = self.get_binance_price()
         ptb = state.price_to_beat
 
         if chainlink and ptb:
@@ -433,8 +350,6 @@ class PostCloseSniperStrategy(BaseStrategy):
                 f"Delta=${delta:+.2f} | "
                 f"Predicted={predicted} {'(CONFIDENT)' if confident else '(uncertain)'}"
             )
-        if binance:
-            logger.info(f"[Sniper] Binance: ${binance:,.2f}")
 
     async def on_market_end(self, market_data: Dict, winner: Optional[str]) -> None:
         """

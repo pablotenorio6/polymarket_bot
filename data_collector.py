@@ -37,6 +37,8 @@ class MarketData:
     down_token_id: str
     snapshots: List[PriceSnapshot] = field(default_factory=list)
     winner: Optional[str] = None
+    start_crypto_price: Optional[float] = None  # Chainlink price at event start
+    end_crypto_price: Optional[float] = None    # Chainlink price at event end
 
 
 class DataCollector:
@@ -108,6 +110,11 @@ class DataCollector:
         
         Clears any previous market data.
         """
+        # Capture Chainlink price at event start
+        start_crypto_price = None
+        if self._rtds_client:
+            start_crypto_price = self._rtds_client.get_price(self._crypto_symbol)
+
         self.current_market = MarketData(
             condition_id=condition_id,
             question=question,
@@ -115,11 +122,13 @@ class DataCollector:
             end_time=end_time,
             up_token_id=up_token_id,
             down_token_id=down_token_id,
-            snapshots=[]
+            snapshots=[],
+            start_crypto_price=round(start_crypto_price, 2) if start_crypto_price else None,
         )
         self.last_record_time = 0
-        
-        # logger.info(f"[DataCollector] Started collecting: {question[:50]}...")
+
+        if start_crypto_price:
+            logger.info(f"[DataCollector] Start Chainlink {self._crypto_symbol}: ${start_crypto_price:,.2f}")
     
     def record_price(self, up_price: float, down_price: float) -> bool:
         """
@@ -175,7 +184,14 @@ class DataCollector:
             return False
         
         self.current_market.winner = winner
-        
+
+        # Capture Chainlink price at event end
+        if self._rtds_client:
+            end_price = self._rtds_client.get_price(self._crypto_symbol)
+            if end_price:
+                self.current_market.end_crypto_price = round(end_price, 2)
+                logger.info(f"[DataCollector] End Chainlink {self._crypto_symbol}: ${end_price:,.2f}")
+
         # Prepare payload
         payload = {
             "condition_id": self.current_market.condition_id,
@@ -186,12 +202,14 @@ class DataCollector:
             "down_token_id": self.current_market.down_token_id,
             "winner": self.current_market.winner,
             "crypto_symbol": self._crypto_symbol,  # BTC, ETH, SOL
+            "start_crypto_price": self.current_market.start_crypto_price,
+            "end_crypto_price": self.current_market.end_crypto_price,
             "snapshots": [
                 {
                     "timestamp": s.timestamp.isoformat(),
                     "up_price": round(s.up_price, 4),
                     "down_price": round(s.down_price, 4),
-                    "crypto_price": s.crypto_price  # Price from Polymarket RTDS
+                    "crypto_price": s.crypto_price  # Chainlink price
                 }
                 for s in self.current_market.snapshots
             ]
