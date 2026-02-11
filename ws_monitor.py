@@ -10,6 +10,7 @@ Optimized for minimal CPU usage:
 
 import asyncio
 import logging
+import time
 from typing import Dict, Optional, Callable, List
 from datetime import datetime
 
@@ -200,7 +201,7 @@ class WebSocketPriceMonitor:
         # Update price
         self.prices[asset_id] = price
         self.last_update = datetime.now()
-        
+
         # Callback if registered
         if self.on_price_update:
             self.on_price_update(asset_id, price)
@@ -250,24 +251,66 @@ class HybridPriceMonitor:
     with HTTP fallback for initial data and recovery.
     """
     
+    STALENESS_THRESHOLD = 30.0  # seconds without price update → force reconnect
+
     __slots__ = (
         'http_monitor', 'ws_monitor', 'use_websocket',
-        'current_up_token', 'current_down_token'
+        'current_up_token', 'current_down_token',
+        '_last_price_ts', '_reconnecting'
     )
-    
+
     def __init__(self, http_monitor):
         self.http_monitor = http_monitor
         self.ws_monitor = WebSocketPriceMonitor()
         self.use_websocket = True
         self.current_up_token: Optional[str] = None
         self.current_down_token: Optional[str] = None
+        self._last_price_ts: float = 0.0  # monotonic clock of last price update
+        self._reconnecting: bool = False
     
     async def start(self):
         """Start WebSocket connection"""
         if await self.ws_monitor.connect():
+            # Hook callback to track last price receive time
+            original_cb = self.ws_monitor.on_price_update
+            def _track_ts(asset_id, price):
+                self._last_price_ts = time.monotonic()
+                if original_cb:
+                    original_cb(asset_id, price)
+            self.ws_monitor.on_price_update = _track_ts
             asyncio.create_task(self.ws_monitor.listen())
             return True
         return False
+
+    async def check_staleness(self) -> bool:
+        """
+        Check if WS price data is stale (>30s since last update).
+        Forces reconnection if stale. Returns True if reconnection was triggered.
+        """
+        if self._reconnecting or not self._last_price_ts:
+            return False
+
+        elapsed = time.monotonic() - self._last_price_ts
+        if elapsed < self.STALENESS_THRESHOLD:
+            return False
+
+        logger.warning(
+            f"[WS STALE] No price update for {elapsed:.0f}s — forcing reconnection"
+        )
+        self._reconnecting = True
+        try:
+            await self._reconnect_ws()
+            if self.current_up_token and self.current_down_token:
+                await self.ws_monitor.subscribe(
+                    [self.current_up_token, self.current_down_token]
+                )
+            self._last_price_ts = time.monotonic()  # reset after reconnect
+            logger.info("[WS STALE] Reconnected successfully")
+        except Exception as e:
+            logger.error(f"[WS STALE] Reconnection failed: {e}")
+        finally:
+            self._reconnecting = False
+        return True
     
     async def _reconnect_ws(self):
         """Reconnect WebSocket with fresh state"""
@@ -288,6 +331,7 @@ class HybridPriceMonitor:
         """Subscribe to price updates for a market"""
         self.current_up_token = up_token
         self.current_down_token = down_token
+        self._last_price_ts = time.monotonic()  # reset staleness timer
 
         # RECONNECT WebSocket for clean subscription state
         await self._reconnect_ws()

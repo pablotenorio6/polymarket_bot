@@ -500,6 +500,10 @@ class FastTradingBot:
         FAST PATH: Minimal latency price check and execution.
         Uses WebSocket for instant prices (no HTTP call).
         """
+        # Check for stale WebSocket data and force reconnect if needed
+        if self.use_websocket:
+            await self.ws_monitor.check_staleness()
+
         # Get prices - WebSocket (instant) or HTTP (fallback)
         if self.use_websocket:
             # INSTANT: Read from memory (no network call!)
