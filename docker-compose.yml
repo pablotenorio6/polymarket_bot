@@ -151,6 +151,29 @@ services:
       - ev  # Start with: docker compose --profile ev up
 
   # ============================================
+  # POSTCLOSE SNIPER - Directional bet on Chainlink delta
+  # Buys winning side during post-close CLOB lag window
+  # ============================================
+
+  bot-btc-sniper:
+    build: .
+    container_name: polymarket-btc-sniper
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_MARKET=btc
+      - BOT_MODE=trade
+      - BOT_STRATEGY=postclose_sniper
+    command: python main.py --market btc --mode trade --strategy postclose_sniper
+    volumes:
+      - ./logs:/app/logs
+    tty: true
+    stdin_open: true
+    profiles:
+      - sniper  # Start with: docker compose --profile sniper up
+
+  # ============================================
   # FRONTRUN STRATEGY - Binance signal detection
   # Monitors Binance aggTrade for large trades
   # Records price evolution to CSV (no trading)

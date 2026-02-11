@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, Tuple
 from datetime import datetime
 
 import websockets
@@ -39,6 +39,7 @@ class RTDSCryptoPrices:
         # Price cache
         self.prices: Dict[str, float] = {}
         self.last_update: Dict[str, datetime] = {}
+        self.timestamps: Dict[str, int] = {}  # symbol -> Chainlink oracle timestamp (ms)
         
         # Callback for price updates
         self.on_price_update: Optional[Callable[[str, float], None]] = None
@@ -201,16 +202,19 @@ class RTDSCryptoPrices:
 
             # Get price from 'value' field
             price = payload.get('value')
+            timestamp_ms = payload.get('timestamp')
             if price is not None and symbol:
-                self._update_price(symbol, float(price))
+                self._update_price(symbol, float(price), timestamp_ms)
 
         except Exception as e:
             logger.debug(f"[RTDS] Error processing price: {e}")
     
-    def _update_price(self, symbol: str, price: float):
+    def _update_price(self, symbol: str, price: float, timestamp_ms: Optional[int] = None):
         """Update price cache and trigger callback"""
         self.prices[symbol] = price
         self.last_update[symbol] = datetime.now()
+        if timestamp_ms is not None:
+            self.timestamps[symbol] = timestamp_ms
         
         if self.on_price_update:
             self.on_price_update(symbol, price)
@@ -256,7 +260,24 @@ class RTDSCryptoPrices:
             Price or None if not available
         """
         return self.prices.get(symbol.upper())
-    
+
+    def get_price_with_ts(self, symbol: str = "BTC") -> Optional[Tuple[float, int]]:
+        """
+        Get current price and Chainlink oracle timestamp for a symbol.
+
+        Args:
+            symbol: Crypto symbol (BTC, ETH, SOL)
+
+        Returns:
+            (price, chainlink_timestamp_ms) or None if not available
+        """
+        sym = symbol.upper()
+        price = self.prices.get(sym)
+        ts = self.timestamps.get(sym)
+        if price is not None and ts is not None:
+            return (price, ts)
+        return None
+
     def get_btc_price(self) -> Optional[float]:
         """Get current BTC price"""
         return self.get_price("BTC")

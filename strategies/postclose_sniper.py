@@ -1,34 +1,30 @@
 """
-Post-Close Sniper Strategy
+Post-Close Sniper Strategy (Simplified)
 
-Exploits the ~2-minute post-close window where Polymarket CLOB still accepts
-trades after a market theoretically ends. Uses the Chainlink price feed
-(the actual resolution oracle) to determine the winner before resolution,
-then buys the winning side at cheap prices during the lag window.
+Pure directional bet based on Chainlink oracle price delta.
 
-How it works:
-1. PREPARATION: On market detection, subscribe to Chainlink + Binance feeds
-2. PRICE-TO-BEAT CAPTURE: Record Chainlink price at market start time
-3. MONITORING: Track Chainlink price vs price-to-beat throughout the market
-4. SNIPE WINDOW: In the last seconds before close + ~120s after close,
-   if Chainlink clearly shows a winner, buy that side aggressively via FOK
-5. POST-CLOSE CASCADE: Place FOK buys at increasing prices until filled
+Resolution rule (for a 2:00-2:15 market):
+  - Init price:  last Chainlink update with ts <= start_time (2:00:00.000)
+  - Final price: last Chainlink update with ts <= end_time   (2:15:00.000)
+  - UP wins if final > init, DOWN wins if final < init
 
-Key insight: The CLOB continues accepting orders for ~120s after end_time.
-Chainlink price (used for actual resolution) is available via RTDS ~1s updates.
-Binance price lags Chainlink by $60-70 but is irrelevant for resolution.
+Strategy flow:
+1. on_new_market:    Store scheduled start/end times (ms) for timestamp comparison
+2. on_market_active: Capture start Chainlink price (verify ts <= start_time_ms),
+                     pre-sign UP + DOWN market orders
+3. on_price_update:  Continuously track last Chainlink price with ts <= end_time_ms.
+                     When we see a Chainlink ts > end_time_ms, the end price is
+                     finalized → compare vs start → POST the winning pre-signed order.
+4. on_market_end:    Log accuracy
 
-Requires:
-- RTDS with Chainlink subscription (crypto_prices_chainlink topic)
-- Fast order execution (FOK orders via FastTrader)
-- Extended market monitoring window (don't stop at end_time)
+Requires RTDS Chainlink feed for oracle prices.
 """
 
 import logging
 import time
-from typing import Dict, Optional, List, Tuple
-from datetime import datetime, timedelta
-from enum import Enum
+from dataclasses import dataclass
+from typing import Dict, Optional
+from datetime import datetime
 
 import pytz
 
@@ -36,122 +32,132 @@ from strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-
-class SnipePhase(Enum):
-    """Current phase of the sniper strategy for a market"""
-    WAITING = "waiting"           # Market not yet near end
-    PRE_SNIPE = "pre_snipe"       # Last 30s before close, high-alert monitoring
-    SNIPE_ACTIVE = "snipe_active" # Post-close window, actively sniping
-    DONE = "done"                 # Sniped or window expired
-
-
-# FOK order price cascade - try cheap first, then more aggressive
-SNIPE_PRICE_CASCADE = [0.01, 0.02, 0.05, 0.10, 0.20, 0.35, 0.50]
-
 # Configuration
-CHAINLINK_CONFIDENCE_THRESHOLD_USD = 15.0  # Min $ delta from price_to_beat to act
-PRE_SNIPE_SECONDS = 30                     # Start pre-snipe N seconds before close
-POST_CLOSE_WINDOW_SECONDS = 120            # How long post-close to keep sniping
-MAX_SNIPE_ATTEMPTS = 10                    # Max FOK orders per market
-SNIPE_SIZE_USD = 200                       # Size per snipe order
-CASCADE_INTERVAL_MS = 500                  # Min ms between cascade attempts
+SNIPE_SIZE_USD = 10         # $ per order
+MAX_PRICE = 0.999            # Market order price cap
+MAX_RETRIES = 3             # Retries if POST fails
+GRACE_SECONDS = 30          # Seconds post-close for retries
+PRE_END_TRACK_S = 10        # Start tracking Chainlink price N seconds before end_time
+
+
+@dataclass
+class MarketState:
+    """Tracks state for a single market snipe."""
+    condition_id: str
+    question: str
+    up_token_id: str
+    down_token_id: str
+    start_time: datetime
+    end_time: datetime
+    start_time_ms: int = 0      # start_time as epoch ms (for Chainlink ts comparison)
+    end_time_ms: int = 0        # end_time as epoch ms
+    start_chainlink_price: Optional[float] = None
+    start_chainlink_ts: Optional[int] = None
+    end_chainlink_price: Optional[float] = None
+    end_chainlink_ts: Optional[int] = None
+    end_price_finalized: bool = False
+    presigned_up: Optional[object] = None
+    presigned_down: Optional[object] = None
+    order_sent: bool = False
+    order_result: Optional[Dict] = None
+    order_side: Optional[str] = None
+    retries: int = 0
 
 
 class PostCloseSniperStrategy(BaseStrategy):
     """
-    Snipe the post-close window using Chainlink oracle prices.
+    Simplified post-close sniper: directional bet based on Chainlink delta.
 
-    Unlike early_queue (passive GTC orders placed hours early),
-    this strategy is reactive: it watches the Chainlink price in real-time,
-    waits until the resolution outcome is clear, then aggressively buys
-    the winning side during the post-close lag window.
-
-    Can run alongside early_queue for complementary coverage.
+    Continuously tracks last Chainlink price with ts <= end_time_ms.
+    Finalizes when a Chainlink update with ts > end_time_ms arrives,
+    then POSTs the pre-signed order for the winning side.
     """
 
     name = "postclose_sniper"
-    description = "Snipe post-close window using Chainlink oracle feed"
+    description = "Directional snipe using Chainlink start/end price delta"
 
-    # Resource requirements
-    requires_price_websocket = True   # Need token prices to see orderbook state
-    requires_data_collector = True    # Record outcomes
-    requires_rtds = True              # Need Chainlink + Binance feeds
+    requires_price_websocket = True
+    requires_data_collector = False
+    requires_rtds = True
 
-    # Keep monitoring for 120s after market close (the CLOB lag window)
-    post_close_grace_seconds = POST_CLOSE_WINDOW_SECONDS
+    post_close_grace_seconds = GRACE_SECONDS
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-        # Per-market state: condition_id -> MarketSnipeState
-        self.market_states: Dict[str, "MarketSnipeState"] = {}
+        self.market_states: Dict[str, MarketState] = {}
 
     async def initialize(self) -> None:
-        """
-        Initialize post-close sniper strategy.
-
-        RTDS now subscribes directly to crypto_prices_chainlink,
-        so Chainlink prices are available via rtds_client.get_price().
-        """
-        logger.info("[Sniper] Initializing post-close sniper strategy")
-
+        logger.info("[Sniper] Initializing post-close sniper (simplified)")
         if not (self.rtds_client and self.rtds_client.connected):
-            logger.warning("[Sniper] RTDS not connected - Chainlink feed unavailable")
-            logger.warning("[Sniper] Strategy will not be able to determine winners")
+            logger.warning("[Sniper] RTDS not connected - strategy will not work")
 
-    def get_chainlink_price(self, symbol: str = None) -> Optional[float]:
-        """Get current Chainlink price from RTDS."""
-        sym = (symbol or self.market_symbol).upper()
-        if self.rtds_client:
-            return self.rtds_client.get_price(sym)
-        return None
-
-    # ==================== Strategy Lifecycle ====================
+    # ==================== Lifecycle ====================
 
     async def on_new_market(self, market_data: Dict) -> None:
-        """
-        Register new market for sniping.
-        Unlike early_queue, we DON'T place orders yet - we wait for the snipe window.
-        """
         condition_id = market_data['condition_id']
-
         if self.is_market_processed(condition_id):
             return
 
-        state = MarketSnipeState(
+        start_time = market_data['start_time']
+        end_time = market_data['end_time']
+
+        state = MarketState(
             condition_id=condition_id,
             question=market_data.get('question', ''),
             up_token_id=market_data['up_token_id'],
             down_token_id=market_data['down_token_id'],
-            start_time=market_data['start_time'],
-            end_time=market_data['end_time'],
+            start_time=start_time,
+            end_time=end_time,
+            start_time_ms=int(start_time.timestamp() * 1000),
+            end_time_ms=int(end_time.timestamp() * 1000),
         )
         self.market_states[condition_id] = state
+        self.mark_market_processed(condition_id)
 
-        logger.info(f"[Sniper] Registered market for sniping: {state.question[:50]}...")
-        logger.info(f"[Sniper]   End time: {state.end_time}")
+        logger.info(
+            f"[Sniper] Registered: {state.question[:60]} | "
+            f"start={start_time} end={end_time}"
+        )
 
     async def on_market_active(self, market_data: Dict) -> None:
-        """
-        Market is now active. Capture the "price to beat" from Chainlink.
-
-        The price_to_beat is the Chainlink price at market start time.
-        If final Chainlink price >= price_to_beat -> UP wins.
-        If final Chainlink price < price_to_beat -> DOWN wins.
-        """
+        """Capture start price (verify ts <= start_time_ms) and pre-sign both orders."""
         condition_id = market_data['condition_id']
         state = self.market_states.get(condition_id)
-
         if not state:
             return
 
-        chainlink_price = self.get_chainlink_price()
+        # Capture Chainlink start price
+        if self.rtds_client:
+            result = self.rtds_client.get_price_with_ts(self.market_symbol)
+            if result:
+                price, ts = result
+                state.start_chainlink_price = price
+                state.start_chainlink_ts = ts
+                if ts <= state.start_time_ms:
+                    logger.info(
+                        f"[Sniper] Start price: ${price:,.2f} "
+                        f"(chainlink_ts={ts} <= start={state.start_time_ms})"
+                    )
+                else:
+                    logger.warning(
+                        f"[Sniper] Start price: ${price:,.2f} "
+                        f"(chainlink_ts={ts} > start={state.start_time_ms}, may be post-start)"
+                    )
+            else:
+                logger.warning("[Sniper] Could not capture start Chainlink price")
+                return
 
-        if chainlink_price:
-            state.price_to_beat = chainlink_price
-            logger.info(f"[Sniper] PRICE TO BEAT captured: ${chainlink_price:,.2f} (Chainlink)")
-        else:
-            logger.warning(f"[Sniper] Could not capture Chainlink price at market start!")
+        # Pre-sign market buy orders for both sides
+        state.presigned_up = self.trader.presign_market_buy(
+            state.up_token_id, MAX_PRICE, SNIPE_SIZE_USD
+        )
+        state.presigned_down = self.trader.presign_market_buy(
+            state.down_token_id, MAX_PRICE, SNIPE_SIZE_USD
+        )
+
+        up_ok = "OK" if state.presigned_up else "FAIL"
+        down_ok = "OK" if state.presigned_down else "FAIL"
+        logger.info(f"[Sniper] Pre-signed orders: UP={up_ok}, DOWN={down_ok}")
 
     async def on_price_update(
         self,
@@ -162,269 +168,145 @@ class PostCloseSniperStrategy(BaseStrategy):
         market: Dict
     ) -> None:
         """
-        Main decision loop. Called every ~10ms.
-
-        Phases:
-        1. WAITING: Just track prices, nothing to do
-        2. PRE_SNIPE: High alert, prepare for sniping
-        3. SNIPE_ACTIVE: Actively try to buy the winner
-        4. DONE: All done for this market
+        Hot path (~10ms). Two jobs:
+        1. Track last Chainlink price with ts <= end_time_ms (rolling update)
+        2. When Chainlink ts > end_time_ms → end price finalized → execute
         """
         condition_id = market.get('conditionId')
         if not condition_id:
             return
 
         state = self.market_states.get(condition_id)
-        if not state or state.phase == SnipePhase.DONE:
+        if not state or state.order_sent or not state.start_chainlink_price:
             return
 
-        now = datetime.now(pytz.UTC)
-        time_to_end = (state.end_time - now).total_seconds()
-
-        # Update token price state
-        state.last_up_price = up_price
-        state.last_down_price = down_price
-
-        # Phase transitions
-        if state.phase == SnipePhase.WAITING:
-            if time_to_end <= PRE_SNIPE_SECONDS:
-                state.phase = SnipePhase.PRE_SNIPE
-                logger.info(f"[Sniper] PRE-SNIPE phase: {time_to_end:.0f}s to close")
-                self._log_oracle_state(state)
-
-        elif state.phase == SnipePhase.PRE_SNIPE:
-            if time_to_end <= 0:
-                state.phase = SnipePhase.SNIPE_ACTIVE
-                state.snipe_start_time = time.time()
-                logger.info(f"[Sniper] === SNIPE WINDOW OPEN === Market closed!")
-                self._log_oracle_state(state)
-
-        elif state.phase == SnipePhase.SNIPE_ACTIVE:
-            # Check if window expired
-            elapsed = time.time() - state.snipe_start_time
-            if elapsed > POST_CLOSE_WINDOW_SECONDS:
-                state.phase = SnipePhase.DONE
-                self.mark_market_processed(condition_id)
-                logger.info(f"[Sniper] Snipe window expired ({elapsed:.0f}s). Filled: {state.total_filled_shares:.1f} shares")
+        # Only start tracking in the last N seconds before end_time
+        if not state.end_price_finalized:
+            now = datetime.now(pytz.UTC)
+            seconds_to_end = (state.end_time - now).total_seconds()
+            if seconds_to_end > PRE_END_TRACK_S:
                 return
 
-            # Check max attempts
-            if state.snipe_attempts >= MAX_SNIPE_ATTEMPTS:
-                state.phase = SnipePhase.DONE
-                self.mark_market_processed(condition_id)
-                logger.info(f"[Sniper] Max attempts reached. Filled: {state.total_filled_shares:.1f} shares")
-                return
-
-            # Rate limit: don't spam orders
-            if state.last_snipe_time and (time.time() - state.last_snipe_time) * 1000 < CASCADE_INTERVAL_MS:
-                return
-
-            # === CORE SNIPING LOGIC ===
-            await self._try_snipe(state, up_token_id, down_token_id, market)
-
-    async def _try_snipe(
-        self,
-        state: "MarketSnipeState",
-        up_token_id: str,
-        down_token_id: str,
-        market: Dict
-    ):
-        """
-        Core sniping logic: determine winner from Chainlink, place FOK buy.
-
-        Decision: Compare current Chainlink price vs price_to_beat.
-        - If chainlink_now >= price_to_beat + threshold -> BUY UP
-        - If chainlink_now <= price_to_beat - threshold -> BUY DOWN
-        - Otherwise -> no action (too uncertain)
-        """
-        chainlink_now = self.get_chainlink_price()
-        if not chainlink_now or not state.price_to_beat:
+        # Read current RTDS Chainlink price + oracle timestamp
+        if not self.rtds_client:
             return
-
-        delta = chainlink_now - state.price_to_beat
-
-        # Determine predicted winner
-        if delta >= CHAINLINK_CONFIDENCE_THRESHOLD_USD:
-            predicted_winner = "UP"
-            confidence_usd = delta
-        elif delta <= -CHAINLINK_CONFIDENCE_THRESHOLD_USD:
-            predicted_winner = "DOWN"
-            confidence_usd = abs(delta)
-        else:
-            # Not confident enough
-            if state.snipe_attempts == 0:
-                logger.debug(f"[Sniper] Delta ${delta:+.2f} below threshold (${CHAINLINK_CONFIDENCE_THRESHOLD_USD})")
+        result = self.rtds_client.get_price_with_ts(self.market_symbol)
+        if not result:
             return
+        price, chainlink_ts = result
 
-        # Pick target token
-        if predicted_winner == "UP":
-            target_token = up_token_id
-            current_price = state.last_up_price
-        else:
-            target_token = down_token_id
-            current_price = state.last_down_price
-
-        # Determine FOK price from cascade
-        cascade_idx = min(state.cascade_index, len(SNIPE_PRICE_CASCADE) - 1)
-        snipe_price = SNIPE_PRICE_CASCADE[cascade_idx]
-
-        # Don't snipe if market price already converged (winner side > $0.80)
-        if current_price > 0.80:
-            logger.info(f"[Sniper] {predicted_winner} already at ${current_price:.2f}, too expensive. Skipping.")
-            state.phase = SnipePhase.DONE
-            self.mark_market_processed(state.condition_id)
-            return
-
-        # Don't snipe at a price higher than the current market price would justify
-        # We want to buy CHEAP (below current market price)
-        if snipe_price > current_price + 0.05:
-            logger.debug(f"[Sniper] Cascade price ${snipe_price:.2f} > market ${current_price:.2f}+0.05. Waiting.")
-            return
-
-        # Place FOK order
-        elapsed = time.time() - state.snipe_start_time if state.snipe_start_time else 0
-        logger.info(
-            f"[Sniper] SNIPE #{state.snipe_attempts + 1}: "
-            f"BUY {predicted_winner} @ ${snipe_price:.2f} (FOK) | "
-            f"Chainlink: ${chainlink_now:,.2f} vs PTB: ${state.price_to_beat:,.2f} "
-            f"(delta: ${delta:+.2f}) | "
-            f"Market {predicted_winner}: ${current_price:.2f} | "
-            f"+{elapsed:.0f}s post-close"
-        )
-
-        result = self.trader.place_buy_order(
-            token_id=target_token,
-            side=predicted_winner.lower(),
-            price=snipe_price,
-            size=SNIPE_SIZE_USD,
-            market_info=market,
-            order_type="FOK"
-        )
-
-        state.snipe_attempts += 1
-        state.last_snipe_time = time.time()
-
-        if result:
-            success = result.get('success', False)
-            status = result.get('status', '')
-
-            if success or status == 'matched':
-                filled_shares = SNIPE_SIZE_USD / snipe_price
-                state.total_filled_shares += filled_shares
-                state.total_cost += SNIPE_SIZE_USD
-                state.fills.append({
-                    'time': datetime.now(pytz.UTC).isoformat(),
-                    'side': predicted_winner,
-                    'price': snipe_price,
-                    'shares': filled_shares,
-                    'chainlink': chainlink_now,
-                    'delta': delta,
-                })
-                logger.info(
-                    f"[Sniper] FILLED! {filled_shares:.0f} shares {predicted_winner} @ ${snipe_price:.2f} | "
-                    f"Potential payout: ${filled_shares:.0f}"
-                )
-                # Move to next cascade price for additional fills
-                state.cascade_index += 1
+        # --- Track end price: keep latest Chainlink update with ts <= end_time ---
+        if not state.end_price_finalized:
+            if chainlink_ts <= state.end_time_ms:
+                state.end_chainlink_price = price
+                state.end_chainlink_ts = chainlink_ts
+                return  # Market still open per Chainlink clock
             else:
-                logger.info(f"[Sniper] Order not filled (status={status}). Escalating price.")
-                state.cascade_index += 1
+                # First Chainlink update past end_time → end price is finalized
+                state.end_price_finalized = True
+                if state.end_chainlink_price is not None:
+                    delta = state.end_chainlink_price - state.start_chainlink_price
+                    logger.info(
+                        f"[Sniper] End price finalized: ${state.end_chainlink_price:,.2f} "
+                        f"(ts={state.end_chainlink_ts}, delta: ${delta:+.2f}) | "
+                        f"New Chainlink ts={chainlink_ts} > end={state.end_time_ms}"
+                    )
+                else:
+                    # Edge case: first Chainlink update we see is already past end_time
+                    # Use it as end price (best we have)
+                    state.end_chainlink_price = price
+                    state.end_chainlink_ts = chainlink_ts
+                    delta = state.end_chainlink_price - state.start_chainlink_price
+                    logger.warning(
+                        f"[Sniper] No pre-end Chainlink seen, using post-end: "
+                        f"${price:,.2f} (ts={chainlink_ts}, delta: ${delta:+.2f})"
+                    )
+
+        # --- End price finalized: determine direction and execute ---
+        self._execute_snipe(state)
+
+    def _execute_snipe(self, state: MarketState) -> None:
+        """Compare start vs end Chainlink price and POST pre-signed order."""
+        if state.order_sent or state.end_chainlink_price is None:
+            return
+
+        # Determine direction
+        if state.end_chainlink_price > state.start_chainlink_price:
+            side = "UP"
+            signed_order = state.presigned_up
+        elif state.end_chainlink_price < state.start_chainlink_price:
+            side = "DOWN"
+            signed_order = state.presigned_down
         else:
-            logger.warning(f"[Sniper] Order placement failed")
-            state.cascade_index += 1
+            state.order_sent = True
+            logger.info("[Sniper] Start == End price, skipping")
+            return
 
-    def _log_oracle_state(self, state: "MarketSnipeState"):
-        """Log current oracle prices and prediction."""
-        chainlink = self.get_chainlink_price()
-        ptb = state.price_to_beat
+        if not signed_order:
+            logger.warning(f"[Sniper] No pre-signed order for {side}")
+            state.order_sent = True
+            return
 
-        if chainlink and ptb:
-            delta = chainlink - ptb
-            predicted = "UP" if delta >= 0 else "DOWN"
-            confident = abs(delta) >= CHAINLINK_CONFIDENCE_THRESHOLD_USD
+        if state.retries >= MAX_RETRIES:
+            logger.warning(f"[Sniper] Max retries reached for {state.condition_id[:16]}")
+            state.order_sent = True
+            return
 
+        # POST pre-signed order (fast path: ~20-50ms)
+        t0 = time.perf_counter()
+        result = self.trader.post_presigned_order(signed_order, "FAK")
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        if result and result.get('success'):
+            state.order_sent = True
+            state.order_result = result
+            state.order_side = side
+            order_id = result.get('orderID', 'N/A')
             logger.info(
-                f"[Sniper] Oracle state: "
-                f"Chainlink=${chainlink:,.2f} | "
-                f"PTB=${ptb:,.2f} | "
-                f"Delta=${delta:+.2f} | "
-                f"Predicted={predicted} {'(CONFIDENT)' if confident else '(uncertain)'}"
+                f"[Sniper] FILLED {side} ${SNIPE_SIZE_USD} in {latency_ms:.1f}ms "
+                f"| orderID={order_id[:16] if order_id != 'N/A' else 'N/A'}"
             )
+        else:
+            state.retries += 1
+            error_msg = result.get('errorMsg', 'unknown') if result else 'no response'
+            logger.warning(
+                f"[Sniper] Retry {state.retries}/{MAX_RETRIES}: {error_msg} ({latency_ms:.1f}ms)"
+            )
+            # Re-sign for next attempt (nonce/timestamp may expire)
+            if side == "UP":
+                state.presigned_up = self.trader.presign_market_buy(
+                    state.up_token_id, MAX_PRICE, SNIPE_SIZE_USD
+                )
+            else:
+                state.presigned_down = self.trader.presign_market_buy(
+                    state.down_token_id, MAX_PRICE, SNIPE_SIZE_USD
+                )
 
     async def on_market_end(self, market_data: Dict, winner: Optional[str]) -> None:
-        """
-        Called by main.py when market ends.
-
-        For sniper strategy, the actual sniping happens in on_price_update
-        during the SNIPE_ACTIVE phase. This is just for logging.
-        """
         condition_id = market_data.get('condition_id')
         state = self.market_states.get(condition_id) if condition_id else None
+        if not state:
+            return
 
-        if state and state.fills:
-            total_potential = state.total_filled_shares  # $1 per share if winner
-            logger.info(
-                f"[Sniper] Market end summary: "
-                f"{len(state.fills)} fills, "
-                f"{state.total_filled_shares:.0f} shares, "
-                f"cost ${state.total_cost:.2f}, "
-                f"potential payout ${total_potential:.2f}"
-            )
+        delta_str = "N/A"
+        if state.start_chainlink_price and state.end_chainlink_price:
+            delta = state.end_chainlink_price - state.start_chainlink_price
+            delta_str = f"${delta:+.2f}"
+
+        correct = ""
+        if state.order_side and winner:
+            correct = " CORRECT" if state.order_side == winner else " WRONG"
+
+        logger.info(
+            f"[Sniper] Market end: "
+            f"start=${state.start_chainlink_price or 0:,.2f} (ts={state.start_chainlink_ts}) "
+            f"end=${state.end_chainlink_price or 0:,.2f} (ts={state.end_chainlink_ts}) "
+            f"delta={delta_str} | "
+            f"bet={state.order_side or 'NONE'} winner={winner}{correct} | "
+            f"sent={state.order_sent} retries={state.retries}"
+        )
 
     async def shutdown(self) -> None:
-        """Clean up."""
-        active = [s for s in self.market_states.values() if s.phase != SnipePhase.DONE]
-        if active:
-            logger.info(f"[Sniper] Shutting down with {len(active)} active markets")
-
-        # Log session summary
-        total_fills = sum(len(s.fills) for s in self.market_states.values())
-        total_shares = sum(s.total_filled_shares for s in self.market_states.values())
-        total_cost = sum(s.total_cost for s in self.market_states.values())
-
-        if total_fills > 0:
-            logger.info(
-                f"[Sniper] Session summary: "
-                f"{total_fills} fills across {len(self.market_states)} markets, "
-                f"{total_shares:.0f} total shares, ${total_cost:.2f} total cost"
-            )
-
-
-class MarketSnipeState:
-    """Tracks the sniping state for a single market."""
-
-    def __init__(
-        self,
-        condition_id: str,
-        question: str,
-        up_token_id: str,
-        down_token_id: str,
-        start_time: datetime,
-        end_time: datetime,
-    ):
-        self.condition_id = condition_id
-        self.question = question
-        self.up_token_id = up_token_id
-        self.down_token_id = down_token_id
-        self.start_time = start_time
-        self.end_time = end_time
-
-        # Oracle state
-        self.price_to_beat: Optional[float] = None
-        self.price_to_beat_source: str = "chainlink"  # or "binance_fallback"
-
-        # Token prices (from WebSocket)
-        self.last_up_price: float = 0.0
-        self.last_down_price: float = 0.0
-
-        # Snipe state
-        self.phase: SnipePhase = SnipePhase.WAITING
-        self.snipe_start_time: Optional[float] = None
-        self.snipe_attempts: int = 0
-        self.cascade_index: int = 0
-        self.last_snipe_time: Optional[float] = None
-
-        # Results
-        self.fills: List[Dict] = []
-        self.total_filled_shares: float = 0.0
-        self.total_cost: float = 0.0
+        sent = sum(1 for s in self.market_states.values() if s.order_sent and s.order_side)
+        total = len(self.market_states)
+        logger.info(f"[Sniper] Shutdown: {sent}/{total} markets sniped")

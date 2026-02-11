@@ -456,7 +456,57 @@ class FastTrader:
         except Exception as e:
             logger.error(f"Fast buy failed: {e}")
             return None
-    
+
+    def presign_market_buy(self, token_id: str, max_price: float, amount_usd: float) -> Optional[object]:
+        """
+        Pre-sign a market buy order. Returns signed order for POST later.
+        Separates signing (slow, crypto) from posting (fast, HTTP).
+
+        Args:
+            token_id: Token to buy
+            max_price: Maximum price willing to pay
+            amount_usd: Amount in USD to spend
+
+        Returns:
+            Signed order object, or None if signing failed
+        """
+        if not self.client:
+            return None
+
+        try:
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                price=round(max_price, 2),
+                amount=round(amount_usd, 2),
+                side=BUY,
+                fee_rate_bps=0
+            )
+            return self.client.create_market_order(order_args)
+        except Exception as e:
+            logger.error(f"Failed to pre-sign market buy: {e}")
+            return None
+
+    def post_presigned_order(self, signed_order, order_type: str = "FAK") -> Optional[Dict]:
+        """
+        POST a pre-signed order to the CLOB. Minimal latency path.
+
+        Args:
+            signed_order: Signed order from presign_market_buy or create_order
+            order_type: "FAK" (Fill-And-Kill, partial fills) or "FOK" (Fill-Or-Kill)
+
+        Returns:
+            Order response dict, or None if failed
+        """
+        if not self.client or not signed_order:
+            return None
+
+        try:
+            py_type = OrderType.FOK if order_type == "FOK" else OrderType.FAK
+            return self.client.post_order(signed_order, orderType=py_type)
+        except Exception as e:
+            logger.error(f"Failed to post pre-signed order: {e}")
+            return None
+
     def place_buy_order(
         self,
         token_id: str,
