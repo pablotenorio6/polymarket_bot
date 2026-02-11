@@ -91,6 +91,18 @@ class PostCloseSniperStrategy(BaseStrategy):
         logger.info("[Sniper] Initializing post-close sniper")
         if not (self.rtds_client and self.rtds_client.connected):
             logger.warning("[Sniper] RTDS not connected - strategy will not work")
+            return
+
+        # Seed carried_price with current Chainlink price so the first market can bet
+        result = self.rtds_client.get_price_with_ts(self.market_symbol)
+        if result:
+            self.carried_price, self.carried_ts = result
+            logger.info(
+                f"[Sniper] Initial Chainlink price: ${self.carried_price:,.2f} "
+                f"(ts={self.carried_ts}) → no calibration needed"
+            )
+        else:
+            logger.warning("[Sniper] Could not seed initial price - first market will calibrate")
 
     # ==================== Lifecycle ====================
 
@@ -126,6 +138,16 @@ class PostCloseSniperStrategy(BaseStrategy):
         if not state:
             return
 
+        # Seed from current Chainlink if no carried price yet
+        if self.carried_price is None and self.rtds_client:
+            result = self.rtds_client.get_price_with_ts(self.market_symbol)
+            if result:
+                self.carried_price, self.carried_ts = result
+                logger.info(
+                    f"[Sniper] Start price (seeded): ${self.carried_price:,.2f} "
+                    f"(ts={self.carried_ts})"
+                )
+
         if self.carried_price is not None:
             state.start_chainlink_price = self.carried_price
             state.start_chainlink_ts = self.carried_ts
@@ -144,7 +166,7 @@ class PostCloseSniperStrategy(BaseStrategy):
             down_ok = "OK" if state.presigned_down else "FAIL"
             logger.info(f"[Sniper] Pre-signed orders: UP={up_ok}, DOWN={down_ok}")
         else:
-            logger.info("[Sniper] No carried price yet - calibration market (no bet)")
+            logger.info("[Sniper] No Chainlink data yet - calibration market (no bet)")
 
     async def on_price_update(
         self,
