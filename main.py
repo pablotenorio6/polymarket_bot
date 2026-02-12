@@ -25,6 +25,7 @@ Usage:
 
 import asyncio
 import argparse
+import os
 import signal
 import sys
 import logging
@@ -126,6 +127,7 @@ from redeem import RedeemManager
 from ws_monitor import HybridPriceMonitor
 from data_collector import DataCollector
 from rtds_crypto_prices import RTDSCryptoPrices
+from chainlink_ds import ChainlinkDataStreams
 from scripts.cash_balance import get_available_cash_usdc_from_clob_client
 
 
@@ -240,14 +242,20 @@ class FastTradingBot:
         
         # Start RTDS client for real-time crypto price (if strategy needs it)
         if StrategyClass.requires_rtds:
-            self.rtds_client = RTDSCryptoPrices()
+            if os.environ.get("CHAINLINK_USERNAME"):
+                self.rtds_client = ChainlinkDataStreams()
+                source_label = "Chainlink DS"
+            else:
+                self.rtds_client = RTDSCryptoPrices()
+                source_label = "RTDS"
+
             if await self.rtds_client.start():
                 crypto_symbol = self.market.upper()  # btc -> BTC, eth -> ETH, sol -> SOL
-                logger.info(f"RTDS connected - real-time {crypto_symbol} price enabled")
+                logger.info(f"{source_label} connected - real-time {crypto_symbol} price enabled")
                 if StrategyClass.requires_data_collector:
                     self.data_collector.set_rtds_client(self.rtds_client, crypto_symbol)
             else:
-                logger.warning("RTDS connection failed - crypto price will not be recorded")
+                logger.warning(f"{source_label} connection failed - crypto price will not be recorded")
         else:
             logger.info("Strategy does not require RTDS - skipping")
         
