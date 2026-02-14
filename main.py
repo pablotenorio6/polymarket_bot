@@ -187,7 +187,6 @@ class FastTradingBot:
         
         # Future market scanning config
         self.future_scan_hours = 48  # Scan 48 hours ahead
-        self.last_future_scan = 0
         self.future_scan_interval = 5  # Scan every 5 seconds
         
         # Core components (use persistent client for best performance)
@@ -293,45 +292,46 @@ class FastTradingBot:
             await self.strategy.initialize()
         
         logger.info(f"Starting {'trading' if self.trading_enabled else 'monitoring'} loop...")
-        
+
+        # Launch future market scanner as independent background task
+        # so it doesn't block the fast price-recording loop
+        if self.trading_enabled:
+            asyncio.create_task(self._future_scan_loop())
+
         while self.running:
             loop_start = time.perf_counter()
-            
+
             try:
-                # === TASK 1: Scan for NEW future markets and place orders ===
-                # Only scan and place orders if trading is enabled
-                if self.trading_enabled:
-                    await self._scan_and_place_future_orders()
-                
-                # === TASK 2: Monitor current active market for price data ===
                 # Check if we need to find/refresh current market
                 if self._needs_market_refresh():
                     await asyncio.sleep(POLL_INTERVAL)
                     await self._refresh_market()
-                
+
                 # FAST PATH: Only fetch prices for locked tokens
                 if self.locked_market:
                     await self._fast_iteration()
-                
+
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}", exc_info=True)
-            
+
             # Track performance
             latency = time.perf_counter() - loop_start
             self.loop_count += 1
             self.total_latency += latency
-            
-            # Removed continuous loop stats - only execution latency when orders trigger
-            # if self.loop_count % 5000 == 0:
-            #     # Small sleep to prevent CPU hogging
-            await asyncio.sleep(0.0001)  # 0.1ms sleep
 
-            # if self.loop_count % 10000 == 0:
-            #     avg_latency = self.total_latency / self.loop_count
-            #     logger.info(f"Loop stats: {self.loop_count} iterations, avg {avg_latency*1000:.1f}ms")
+            await asyncio.sleep(0.0001)  # 0.1ms sleep
 
         await self.shutdown()
     
+    async def _future_scan_loop(self):
+        """Background task: scan for future markets every N seconds without blocking the fast path."""
+        while self.running:
+            try:
+                await self._scan_and_place_future_orders()
+            except Exception as e:
+                logger.error(f"Error in future scan loop: {e}", exc_info=True)
+            await asyncio.sleep(self.future_scan_interval)
+
     def _needs_market_refresh(self) -> bool:
         """Check if we need to find a new market"""
         # No market locked yet
@@ -554,14 +554,6 @@ class FastTradingBot:
         Scan for new future markets and notify strategy.
         Strategy decides whether/how to place orders.
         """
-        now = time.time()
-        
-        # Only scan periodically to respect rate limits
-        if now - self.last_future_scan < self.future_scan_interval:
-            return
-        
-        self.last_future_scan = now
-        
         try:
             # Get all future markets (up to 24h ahead)
             future_markets = await self.monitor.get_future_markets(self.future_scan_hours)
