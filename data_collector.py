@@ -133,36 +133,34 @@ class DataCollector:
     def record_price(self, up_price: float, down_price: float) -> bool:
         """
         Record a price snapshot if enough time has passed.
-        Includes BTC price from Chainlink oracle.
-        
+        Records best ask prices for UP/DOWN tokens plus crypto price from Chainlink.
+
         Returns True if a snapshot was recorded, False otherwise.
         """
         if self.current_market is None:
             return False
-        
+
         now = time.time()
-        
+
         # Only record once per interval
         if now - self.last_record_time < self.record_interval:
             return False
-        
+
         # Get current crypto price from Polymarket RTDS
         crypto_price = None
         if self._rtds_client:
             crypto_price = self._rtds_client.get_price(self._crypto_symbol)
-        
-        # Create snapshot with current timestamp and crypto price
-        # Round to 4 decimals for precision
+
         snapshot = PriceSnapshot(
             timestamp=datetime.now(self.et_tz),
             up_price=round(up_price, 4),
             down_price=round(down_price, 4),
             crypto_price=round(crypto_price, 2) if crypto_price else None
         )
-        
+
         self.current_market.snapshots.append(snapshot)
         self.last_record_time = now
-        
+
         return True
     
     async def save_market(self, winner: Optional[str] = None) -> bool:

@@ -35,6 +35,8 @@ WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 # Pre-compute constant strings for faster comparison
 EVENT_TYPE_KEY = 'event_type'
 LAST_TRADE_PRICE = 'last_trade_price'
+PRICE_CHANGE = 'price_change'
+BOOK = 'book'
 ASSET_ID_KEY = 'asset_id'
 PRICE_KEY = 'price'
 
@@ -46,14 +48,15 @@ class WebSocketPriceMonitor:
     """
     
     __slots__ = (
-        'ws', 'prices', 'subscribed_tokens', 'connected', 'running',
+        'ws', 'prices', 'best_asks', 'subscribed_tokens', 'connected', 'running',
         'on_price_update', 'message_count', 'last_update',
         'reconnect_delay', 'max_reconnect_delay'
     )
-    
+
     def __init__(self):
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.prices: Dict[str, float] = {}
+        self.best_asks: Dict[str, float] = {}
         self.subscribed_tokens: List[str] = []
         self.connected = False
         self.running = False
@@ -117,6 +120,7 @@ class WebSocketPriceMonitor:
             # Clear local state
             for tid in tokens_to_remove:
                 self.prices.pop(tid, None)
+                self.best_asks.pop(tid, None)
                 self.subscribed_tokens.remove(tid)
 
             
@@ -179,32 +183,52 @@ class WebSocketPriceMonitor:
         SYNC function - optimized for minimal overhead.
         Only processes events for subscribed tokens.
         """
-        # Fast check: only process last_trade_price events
-        if event.get(EVENT_TYPE_KEY) != LAST_TRADE_PRICE:
-            return
-        
-        asset_id = event.get(ASSET_ID_KEY)
-        price_str = event.get(PRICE_KEY)
-        
-        if not asset_id or not price_str:
-            return
-        
-        # IMPORTANT: Only process tokens we're subscribed to
-        if asset_id not in self.subscribed_tokens:
-            return
-        
-        try:
-            price = float(price_str)
-        except (ValueError, TypeError):
-            return
-        
-        # Update price
-        self.prices[asset_id] = price
-        self.last_update = datetime.now()
+        event_type = event.get(EVENT_TYPE_KEY)
 
-        # Callback if registered
-        if self.on_price_update:
-            self.on_price_update(asset_id, price)
+        if event_type == LAST_TRADE_PRICE:
+            asset_id = event.get(ASSET_ID_KEY)
+            price_str = event.get(PRICE_KEY)
+
+            if not asset_id or not price_str:
+                return
+            if asset_id not in self.subscribed_tokens:
+                return
+
+            try:
+                price = float(price_str)
+            except (ValueError, TypeError):
+                return
+
+            self.prices[asset_id] = price
+            self.last_update = datetime.now()
+
+            if self.on_price_update:
+                self.on_price_update(asset_id, price)
+
+        elif event_type == BOOK:
+            asset_id = event.get(ASSET_ID_KEY)
+            if not asset_id or asset_id not in self.subscribed_tokens:
+                return
+            asks = event.get('asks')
+            if asks:
+                try:
+                    self.best_asks[asset_id] = float(asks[0]['price'])
+                    self.last_update = datetime.now()
+                except (ValueError, TypeError, KeyError, IndexError):
+                    pass
+
+        elif event_type == PRICE_CHANGE:
+            for pc in event.get('price_changes', []):
+                asset_id = pc.get(ASSET_ID_KEY, '')
+                if asset_id not in self.subscribed_tokens:
+                    continue
+                best_ask = pc.get('best_ask')
+                if best_ask and best_ask != '0':
+                    try:
+                        self.best_asks[asset_id] = float(best_ask)
+                        self.last_update = datetime.now()
+                    except (ValueError, TypeError):
+                        pass
     
     async def _reconnect(self):
         """Attempt to reconnect with exponential backoff"""
@@ -238,7 +262,11 @@ class WebSocketPriceMonitor:
     def get_price(self, token_id: str) -> Optional[float]:
         """Get current price for a token (instant, no API call)"""
         return self.prices.get(token_id)
-    
+
+    def get_best_ask(self, token_id: str) -> Optional[float]:
+        """Get current best ask for a token (instant, no API call)"""
+        return self.best_asks.get(token_id)
+
     def get_prices(self, token_ids: List[str]) -> Dict[str, float]:
         """Get prices for multiple tokens (instant, no API call)"""
         prices = self.prices
@@ -316,9 +344,10 @@ class HybridPriceMonitor:
         """Reconnect WebSocket with fresh state"""
         # Close existing connection
         await self.ws_monitor.close()
-        
+
         # Clear all state
         self.ws_monitor.prices.clear()
+        self.ws_monitor.best_asks.clear()
         self.ws_monitor.subscribed_tokens = []
         
         # Reconnect
@@ -372,7 +401,7 @@ class HybridPriceMonitor:
         """Get current prices (instant from memory)"""
         up_token = self.current_up_token
         down_token = self.current_down_token
-        
+
         if not up_token or not down_token:
             return None
 
@@ -384,6 +413,23 @@ class HybridPriceMonitor:
             return None
 
         return {up_token: up_price, down_token: down_price}
+
+    def get_best_asks(self) -> Optional[Dict[str, float]]:
+        """Get current best asks (instant from memory)"""
+        up_token = self.current_up_token
+        down_token = self.current_down_token
+
+        if not up_token or not down_token:
+            return None
+
+        asks = self.ws_monitor.best_asks
+        up_ask = asks.get(up_token)
+        down_ask = asks.get(down_token)
+
+        if up_ask is None or down_ask is None:
+            return None
+
+        return {up_token: up_ask, down_token: down_ask}
     
     async def get_prices_with_fallback(self) -> Optional[Dict[str, float]]:
         """Get prices with HTTP fallback if WebSocket data unavailable"""

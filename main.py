@@ -535,9 +535,14 @@ class FastTradingBot:
         if up_price is None or down_price is None:
             return
 
-        # Record price snapshot (if data collector enabled)
-        if self._data_collector_enabled:
-            self.data_collector.record_price(up_price, down_price)
+        # Record best ask snapshot (if data collector enabled)
+        if self._data_collector_enabled and self.use_websocket:
+            best_asks = self.ws_monitor.get_best_asks()
+            if best_asks:
+                up_ask = best_asks.get(self.locked_up_token)
+                down_ask = best_asks.get(self.locked_down_token)
+                if up_ask is not None and down_ask is not None:
+                    self.data_collector.record_price(up_ask, down_ask)
 
         # Notify strategy of price update (if trading enabled)
         if self.trading_enabled and self.strategy:
