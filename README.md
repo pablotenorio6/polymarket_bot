@@ -1,246 +1,258 @@
-# Polymarket Trading Bot - BTC 15-Minute Markets
+# Polymarket Trading Bot
 
-Bot de trading automático para mercados "Bitcoin Up or Down" de 15 minutos en Polymarket.
+An async, high-performance trading bot for Polymarket crypto prediction markets (BTC, ETH, SOL). Trades 15-minute and hourly up/down markets on the Polygon network via the official `py-clob-client` SDK.
 
-## 📋 Estrategia
+---
 
-**Concepto**: Cuando uno de los lados (UP o DOWN) alcanza un precio alto (96 centavos), compramos ESE MISMO lado esperando que continúe hasta 99+ centavos (momentum trading).
+## Features
 
-**Ejecución**:
-- 🎯 **Trigger**: Cuando cualquier lado alcanza $0.96
-- 💰 **Entry**: Compramos ESE MISMO lado a $0.97 (Fill or Kill)
-- 🛡️ **Stop Loss**: Vendemos si el precio cae a $0.85 (protección de emergencia)
-- 🎉 **Exit**: Esperamos resolución del mercado → $1.00 por acción si ganamos
+- **Sub-100ms order execution** via pre-signed orders (sign at market detection, POST at trade time)
+- **Dual-loop architecture**: ~10ms fast path for price updates, ~15min slow path for market management
+- **Pluggable strategy system**: swap strategies at launch with a single CLI flag
+- **Three independent WebSocket feeds**: Polymarket CLOB prices, Chainlink oracle prices, Binance order flow
+- **Auto-redemption**: converts resolved winning positions back to USDC automatically
+- **Docker-native**: multi-service compose setup for running multiple bots simultaneously
 
-**Ejemplo Ganador**:
+---
+
+## Architecture
+
 ```
-1. Market: "Bitcoin Up or Down - 2:00PM-2:15PM ET"
-2. UP alcanza $0.96 (momentum alcista)
-3. Bot compra UP a $0.97 (costo: $9.70 por 10 acciones)
-4. Market se cierra a las 2:15PM
-5. Bitcoin efectivamente subió → UP gana
-6. Posición se resuelve a $1.00 → Recibimos $10.00
-7. Ganancia: $0.30 (3.1% ROI)
+┌─────────────────────────────────────────────────────┐
+│                   FastTradingBot                    │
+│  ┌──────────────────┐   ┌───────────────────────┐  │
+│  │   Fast Loop      │   │     Slow Loop          │  │
+│  │   (~10ms)        │   │     (~15 min)          │  │
+│  │  Price updates   │   │  Market discovery      │  │
+│  │  Strategy calls  │   │  Order recovery        │  │
+│  │  Order execution │   │  Position redemption   │  │
+│  └──────────────────┘   └───────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+         │               │               │
+  ┌──────┴──────┐  ┌─────┴──────┐  ┌────┴──────────┐
+  │  CLOB WS    │  │ Chainlink  │  │    Binance    │
+  │ (token      │  │ DS / RTDS  │  │  aggTrade +   │
+  │  prices)    │  │ (BTC/ETH/  │  │  OBI signals  │
+  └─────────────┘  │  SOL spot) │  └───────────────┘
+                   └────────────┘
 ```
 
-**Ejemplo Perdedor (Stop Loss)**:
-```
-1. Market: "Bitcoin Up or Down - 3:00PM-3:15PM ET"
-2. DOWN alcanza $0.96
-3. Bot compra DOWN a $0.97 (costo: $9.70 por 10 acciones)
-4. Bitcoin sube fuertemente, DOWN colapsa a $0.85
-5. Stop loss activado → Vendemos a $0.85
-6. Recibimos: $8.50
-7. Pérdida: $1.20 (12.4% ROI)
-```
+### Core Components
 
-## 🚀 Instalación
+| Module | Class | Responsibility |
+|---|---|---|
+| `main.py` | `FastTradingBot` | Event loop orchestrator, strategy lifecycle, CLI |
+| `trader.py` | `FastTrader` | Pre-signed order execution, position tracking |
+| `monitor.py` | `FastMarketMonitor` | Market discovery via Gamma API, batch price fetching |
+| `risk_manager.py` | `FastRiskManager` | Stop loss enforcement, position limits |
+| `auth.py` | `PolymarketAuth` | Wallet authentication (EOA / Magic / Browser proxy) |
+| `redeem.py` | `RedeemManager` | Auto-redeem resolved positions to USDC |
+| `data_collector.py` | `DataCollector` | Per-second price snapshots, API submission on market end |
+| `ws_monitor.py` | `HybridPriceMonitor` | Real-time CLOB token prices with HTTP fallback |
+| `rtds_crypto_prices.py` | `RTDSCryptoPrices` | Chainlink prices via Polymarket RTDS relay (~1s latency) |
+| `chainlink_ds.py` | `ChainlinkDataStreams` | Direct Chainlink Data Streams (lower latency + REST API) |
+| `binance_ws.py` | `BinanceBreakoutDetector` | Binance order book imbalance + trade flow signals |
 
-### 1. Requisitos
-- Python 3.8+
-- Cuenta Polymarket con fondos
-- Wallet private key (para firmar transacciones)
+---
 
-### 2. Instalar dependencias
+## Strategies
+
+### `early_queue` (default)
+Places GTC limit orders on both UP and DOWN outcomes immediately when a market is detected (~24h before start). Exploits Polymarket's FIFO price-tie resolution — earlier orders get queue priority at the same price level.
+
+### `expected_value`
+Trades mispriced tokens using historical probability lookup tables. Calculates expected value against current odds and sizes positions with 1/4 Kelly Criterion. Targets a delta-neutral book by accumulating both sides roughly balanced.
+
+### `whale_copy`
+Monitors a configurable list of target wallets for large directional buys in 15-minute crypto markets. Copies their position when accumulated buy flow exceeds a detection threshold.
+
+### `whale_frontrun`
+Detects unusually large Binance directional volume (99.9th percentile of trailing 10-minute flow) and anticipates the resulting price move on Polymarket. Uses Black-Scholes pricing and EWMA volatility for entry sizing. Exits after a fixed hold period (~4s).
+
+### `postclose_sniper`
+Places a directional bet based on the Chainlink oracle price delta between market open and close. Queries the Chainlink REST API at exact boundary timestamps for definitive prices, then POSTs the winning-side order during the post-close CLOB settlement lag window.
+
+---
+
+## Requirements
+
+- Python 3.12+ (required for `polymarket_apis` / auto-redemption)
+- Polygon wallet funded with USDC
+- Polymarket account with approved USDC/CTF allowances (run `scripts/set_allowances.py` once)
+
+---
+
+## Installation
 
 ```bash
+git clone <repo-url>
+cd polymarket-tests
 pip install -r requirements.txt
 ```
 
-### 3. Configurar credenciales
-
-**Opción A: Archivo .env (Recomendado)**
+Copy and populate the environment file:
 
 ```bash
-# 1. Copiar el template
-cp env.example .env
-
-# 2. Editar .env con tu private key
-# Windows: notepad .env
-# Linux/Mac: nano .env
+cp .env.example .env
 ```
 
-Contenido del archivo `.env`:
-```bash
-POLYMARKET_PRIVATE_KEY=tu_private_key_aqui_sin_0x
-```
+---
 
-**Opción B: Variables de entorno temporales**
-```bash
-# Windows PowerShell
-$env:POLYMARKET_PRIVATE_KEY="tu_private_key_aqui"
+## Configuration
 
-# Linux/Mac
-export POLYMARKET_PRIVATE_KEY="tu_private_key_aqui"
-```
+### `.env` — Secrets
 
-⚠️ **IMPORTANTE**: 
-- NUNCA compartas tu private key
-- El archivo `.env` está en `.gitignore` (no se subirá a git)
-- Usa la key sin el prefijo `0x`
+| Variable | Required | Description |
+|---|---|---|
+| `POLYMARKET_PRIVATE_KEY` | Yes | Wallet private key (hex, no `0x` prefix) |
+| `POLYMARKET_FUNDER_ADDRESS` | No | Separate funding wallet address |
+| `SIGNATURE_TYPE` | No | `0` = EOA (default), `1` = Magic, `2` = Browser proxy |
+| `CHAINLINK_API_KEY` | No | Enables direct Chainlink Data Streams (lower latency) |
+| `CHAINLINK_USERNAME` | No | Chainlink HMAC username |
+| `CHAINLINK_PASSWORD` | No | Chainlink HMAC secret |
+| `DATA_COLLECTOR_API_URL` | No | Local API endpoint for price snapshot submission |
+| `WHALE_TARGET_WALLETS` | No | Comma-separated whale wallet addresses (`whale_copy`) |
+| `BREAKOUT_OBI_THRESHOLD` | No | OBI threshold for `whale_frontrun` |
+| `SNIPE_SIZE_USD` | No | Order size for `postclose_sniper` (default: 10) |
 
-## ⚙️ Configuración
+### `config.py` — Trading Parameters
 
-Edita `config.py` para ajustar los parámetros:
+Key defaults (override in `config.py`):
 
 ```python
-# Precios de estrategia
-TRIGGER_PRICE = 0.96    # Precio para activar compra
-ORDER_PRICE = 0.97      # Precio de entrada
-STOP_LOSS_PRICE = 0.85  # Stop loss
-
-# Tamaño de posición
-MAX_POSITION_SIZE = 10  # USD por trade
-
-# Límites
-MAX_CONCURRENT_POSITIONS = 2  # Máximo de posiciones simultáneas
+ENTRY_PRICE = 0.01              # GTC limit order price
+MAX_POSITION_SIZE = 200         # USD per market
+MAX_CONCURRENT_POSITIONS = 2
+POLL_INTERVAL = 0.01            # 10ms fast loop
+ENABLE_STOP_LOSS = False
 ```
 
-## 🎮 Uso
+---
 
-### Modo Normal (Trading Activo)
+## Usage
+
+### One-time setup
+
 ```bash
+python scripts/set_allowances.py   # Approve USDC + CTF contracts (once per wallet)
+python scripts/cash_balance.py     # Check available USDC balance
+```
+
+### Running the bot
+
+```bash
+# BTC 15-min, early_queue strategy, trade mode (defaults)
 python main.py
+
+# Specify market and strategy
+python main.py --market eth --strategy early_queue
+python main.py --market btc --strategy expected_value
+python main.py --market btc --strategy whale_frontrun
+python main.py --market btc --strategy postclose_sniper
+
+# Monitor only (no orders placed)
+python main.py --market eth --mode monitor
 ```
 
-El bot:
-1. Monitorea mercados BTC 15-min **que están ocurriendo AHORA** (no futuros)
-2. Detecta oportunidades cuando un lado alcanza $0.96
-3. Coloca órdenes automáticamente
-4. Gestiona stop loss y take profit
+**Available markets:** `btc`, `eth`, `sol` (15-minute) | `btc-1h`, `eth-1h` (hourly, no fees)
 
-⏰ **Cómo Funciona**: 
-- Los mercados "Bitcoin Up or Down" de 15 minutos son parte de una serie recurrente
-- El bot genera dinámicamente los slugs de eventos basándose en el timestamp actual
-- Solo encuentra mercados en su ventana activa de 15 minutos
-- Por ejemplo, a las 3:07 PM ET, encontrará el mercado "3:00PM-3:15PM ET"
-- Los mercados se crean automáticamente cada 15 minutos
+**Available strategies:** `early_queue`, `expected_value`, `whale_copy`, `whale_frontrun`, `postclose_sniper`
 
-### Modo Monitor (Sin Trading)
-Si no configuras `POLYMARKET_PRIVATE_KEY`, el bot corre en modo monitor:
-- Muestra mercados activos
-- Muestra precios en tiempo real
-- NO ejecuta trades
+---
 
-## 📁 Estructura del Código
+## Docker Deployment
 
-```
-├── main.py              # Punto de entrada del bot
-├── config.py            # Configuración y parámetros
-├── auth.py              # Autenticación con Polymarket
-├── monitor.py           # Monitoreo de mercados activos
-├── trader.py            # Lógica de trading y órdenes
-├── risk_manager.py      # Stop loss y gestión de riesgo
-├── requirements.txt     # Dependencias
-└── README.md           # Esta documentación
-```
-
-## 🔧 Componentes
-
-### `monitor.py` - Monitoreo de Mercados
-- Busca mercados "Bitcoin Up or Down" de 15 minutos activos
-- Obtiene precios de CLOB `/midpoint` endpoint (precios en tiempo real)
-- Acceso al order book completo para información de trading
-- **Optimización inteligente**: Reutiliza el mercado actual durante su ventana de 15 minutos
-
-**Precios utilizados**:
-- **CLOB Midpoint** ($0.18/$0.82): Precio real de mercado para monitoreo
-- **Order Book** ($0.01/$0.99): Spreads enormes, no útil para monitoreo
-- **outcomePrices** ($0.49/$0.51): Última transacción, puede estar desactualizada
-
-**Optimización de API**:
-El monitor "se bloquea" en un mercado una vez encontrado y solo busca nuevos cuando termina:
-- Sin optimización: ~1,800 búsquedas/hora (una cada 2 segundos)
-- Con optimización: ~4 búsquedas/hora (una por cada mercado de 15 min)
-- **Reducción: 99.8% menos llamadas API**
-
-El bot usa CLOB midpoint para detectar oportunidades ($0.96 trigger) y luego coloca órdenes Fill-or-Kill a precio específico ($0.97).
-
-### `trader.py` - Trading
-- Coloca órdenes Fill or Kill
-- Rastrea posiciones activas
-- Calcula P&L
-
-### `risk_manager.py` - Gestión de Riesgo
-- Stop loss automático
-- Take profit automático
-- Límites de posiciones concurrentes
-
-### `auth.py` - Autenticación
-- Maneja autenticación con Polymarket
-- Usa `py-clob-client` para firmar transacciones
-
-## 📊 Logs
-
-El bot genera logs en:
-- **Consola**: Output en tiempo real
-- **Archivo**: `trading_bot.log`
-
-Niveles de log configurables en `config.py`:
-- `DEBUG`: Información detallada
-- `INFO`: Eventos importantes (default)
-- `WARNING`: Advertencias
-- `ERROR`: Errores
-
-## ⚠️ Riesgos y Consideraciones
-
-### Riesgos Financieros
-- **Pérdidas**: Puedes perder dinero. Usa solo capital que puedas permitirte perder
-- **Slippage**: Órdenes Fill or Kill pueden no ejecutarse si no hay liquidez
-- **Gas fees**: Transacciones en Polygon tienen comisiones
-
-### Limitaciones Técnicas
-- **Granularidad**: Los datos históricos de precios tienen resolución ~10 min
-- **Latencia**: Polling cada 2 segundos puede perder spikes rápidos
-- **Liquidez**: Mercados pequeños pueden tener poca liquidez
-
-### Recomendaciones
-1. **Empieza pequeño**: Usa `MAX_POSITION_SIZE = 1` para pruebas
-2. **Monitorea**: Revisa los logs frecuentemente
-3. **Ajusta stop loss**: Encuentra el balance entre protección y volatilidad
-4. **Diversifica**: No pongas todo en un solo mercado
-
-## 🐛 Troubleshooting
-
-### Error: "POLYMARKET_PRIVATE_KEY not set"
-- Configura la variable de entorno con tu private key
-
-### Error: "py-clob-client not installed"
 ```bash
-pip install py-clob-client
+# BTC trading (default)
+docker compose up bot-btc-trade
+
+# ETH or SOL trading
+docker compose --profile eth up
+docker compose --profile sol up
+
+# Multiple bots simultaneously
+docker compose --profile eth --profile sol up
+
+# Specialized strategies
+docker compose --profile whale up      # Whale copy
+docker compose --profile ev up         # Expected value
+docker compose --profile sniper up     # Post-close sniper
+docker compose --profile frontrun up   # Binance frontrun signal logger
 ```
 
-### Bot no encuentra mercados
-- Verifica que haya mercados BTC 15-min activos en Polymarket
-- Los mercados solo están activos en horarios específicos
+---
 
-### Órdenes no se ejecutan
-- Verifica que tienes fondos suficientes
-- Las órdenes Fill or Kill requieren liquidez inmediata
-- Ajusta `ORDER_PRICE` si es necesario
+## Scripts
 
-## 📚 Recursos
+Standalone utilities in `scripts/` — run directly with `python scripts/<name>.py`:
 
-- [Polymarket Docs](https://docs.polymarket.com/)
-- [CLOB API Docs](https://docs.polymarket.com/#clob-api)
-- [py-clob-client](https://github.com/Polymarket/py-clob-client)
+| Script | Purpose |
+|---|---|
+| `cash_balance.py` | Fetch available USDC balance from CLOB |
+| `set_allowances.py` | Approve USDC/CTF for Polymarket (one-time setup) |
+| `test_order.py` | Test order placement end-to-end |
+| `trade_history.py` | Fetch and display full trade history for wallet |
+| `frontrun_strategy.py` | Standalone Binance aggTrade signal detector (logs to CSV) |
+| `chainlink_latency.py` | Measure and compare RTDS vs direct Chainlink latency |
+| `compare_chainlink_sources.py` | Log BTC price delta between RTDS relay and direct feed |
+| `validate_resolution.py` | Verify Chainlink boundary prices match actual market outcomes |
 
-## 🔒 Seguridad
+---
 
-- ✅ Usa variables de entorno para credenciales
-- ✅ NUNCA hagas commit de tu private key
-- ✅ Agrega `.env` a `.gitignore`
-- ✅ Usa wallets dedicadas para trading bots
+## WebSocket Feeds
 
-## 📝 Notas
+### Polymarket CLOB (`ws_monitor.py`)
+Real-time UP/DOWN token prices. Used by all strategies that need live market odds.
+Endpoint: `wss://ws-subscriptions-clob.polymarket.com/ws/market`
 
-- El código anterior (análisis histórico) está en `/overbetted_test`
-- Este bot opera en tiempo real, no analiza datos históricos
-- Probado con mercados BTC 15-min en Polymarket Polygon
+### Chainlink Data Streams (`chainlink_ds.py`) — recommended
+Direct connection to Chainlink oracle. Provides lower latency than RTDS and exposes a REST API for querying prices at exact timestamps (used by `postclose_sniper`).
+Requires: `CHAINLINK_API_KEY`, `CHAINLINK_USERNAME`, `CHAINLINK_PASSWORD`
 
-## ⚖️ Disclaimer
+### RTDS (`rtds_crypto_prices.py`) — fallback
+Chainlink prices relayed through Polymarket's RTDS service. No credentials required but adds ~1–3s latency. Used automatically when `CHAINLINK_API_KEY` is not set.
 
-Este software se proporciona "tal cual" sin garantías. El trading automatizado conlleva riesgos significativos. El autor no se hace responsable de pérdidas financieras.
+### Binance (`binance_ws.py`)
+`@bookTicker` + `@aggTrade` streams for BTCUSDT. Used exclusively by `whale_frontrun`.
 
-**Úsalo bajo tu propio riesgo.**
+---
 
+## Adding a Strategy
+
+1. Create `strategies/my_strategy.py` — see `strategies/template.py` for the full interface
+2. Subclass `BaseStrategy` and implement `on_new_market()` and `on_price_update()`
+3. Declare resource requirements as class attributes:
+
+   ```python
+   requires_price_websocket = True   # Polymarket CLOB prices
+   requires_data_collector = True    # Price snapshot recording
+   requires_rtds = True              # Chainlink crypto prices
+   post_close_grace_seconds = 0      # Extended monitoring after market end
+   ```
+
+4. Register in `strategies/__init__.py`:
+
+   ```python
+   from .my_strategy import MyStrategy
+   STRATEGIES["my_strategy"] = MyStrategy
+   ```
+
+5. Run with `python main.py --strategy my_strategy`
+
+---
+
+## API Rate Limits
+
+| Endpoint | Limit |
+|---|---|
+| Gamma API `/events` | 50 req/s |
+| CLOB API (general) | 900 req/s |
+| CLOB POST `/order` | 350 req/s burst |
+
+Batch `/midprices` is preferred over individual `/midpoint` calls wherever possible.
+
+---
+
+## Risk Disclaimer
+
+This software is provided for educational and research purposes. Prediction market trading involves significant financial risk. Past performance is not indicative of future results. Use at your own risk.
